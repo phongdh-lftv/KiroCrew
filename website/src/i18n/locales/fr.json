@@ -12814,6 +12814,7 @@
         "last_checked_ago_next_check_in": "Dernière vérification {{ago}}, prochaine vérification automatique {{next}}.",
         "in_app_update_intro": "La nouvelle version s'installe à côté de l'actuelle et bascule de façon atomique. L'application nécessite une commande d'approbation sur l'hôte de la passerelle.",
         "or_update_manually": "Ou relancez l'installateur manuellement",
+        "armed_version_changed": "Une version plus récente vient d’être trouvée : c’est donc la v{{version}} qui sera installée, et non la v{{offered}} proposée il y a un instant.",
         "armed_run_on_host": "Approuvez et appliquez en exécutant cette commande sur l'hôte de la passerelle.",
         "armed_expires_in": "La fenêtre d'approbation se ferme dans {{time}}",
         "armed_waiting_note": "En attente d'approbation — une fois approuvée, la progression s'affiche ici et la passerelle redémarre d'elle-même.",

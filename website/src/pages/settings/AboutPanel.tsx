@@ -328,6 +328,14 @@ function InAppUpdateFlow({ version, manualCommand, isChannelMove }: {
   const [phase, setPhase] = useState<'idle' | 'armed' | 'applying' | 'failed' | 'expired'>('idle')
   const [armed, setArmed] = useState<{
     approveCommand: string
+    /**
+     * What the gateway ACTUALLY armed, folded for display. Not the same as the
+     * `version` prop: the gateway re-checks the feed before arming, so a panel
+     * whose verdict is hours old can offer v1 and arm the newer v2. The armed
+     * copy names this one, or the approval installs a version the UI never
+     * mentioned. Empty for a gateway that predates the field.
+     */
+    versionDisplay: string
     expiresIn: number
     // Absolute wall-clock deadline. The decremented counter is display-only:
     // a throttled background tab fires the 1s tick rarely, so the counter can
@@ -361,6 +369,7 @@ function InAppUpdateFlow({ version, manualCommand, isChannelMove }: {
         const expiresIn = res.expires_in ?? 600
         setArmed({
           approveCommand: res.approve_command,
+          versionDisplay: res.version_display || '',
           expiresIn,
           deadlineMs: Date.now() + expiresIn * 1000,
         })
@@ -503,6 +512,31 @@ function InAppUpdateFlow({ version, manualCommand, isChannelMove }: {
   }
   return (
     <div className="flex flex-col gap-2" data-testid="in-app-update-armed">
+      {/* WHAT was armed, not what the button offered. The gateway re-checks the
+          feed as it arms, so on a panel whose verdict has gone stale these
+          differ — and the approval below installs this one. Reuses the existing
+          "Update to v…" copy rather than inventing a string that would need
+          translating into every locale to say the same thing. */}
+      {armed.versionDisplay && (
+        <p className="text-[13px] text-text" data-testid="armed-version">
+          {i18nT(isChannelMove
+            ? 'pages.settings.aboutPanel.switch_to_version'
+            : 'pages.settings.aboutPanel.update_to_version', { version: armed.versionDisplay })}
+        </p>
+      )}
+      {/* The number CHANGING is the whole point of the re-check, and it is the
+          one thing the line above cannot say. Without this, the user reads
+          "Update to v0.4.7" on the button and "Update to v0.4.8" here and has to
+          guess whether these are two updates or one of them is wrong — seconds
+          before running an approval command on another machine. Worth the new
+          string: only the difference needs explaining, so it is rendered only
+          when there is one. */}
+      {armed.versionDisplay && version && armed.versionDisplay !== version && (
+        <p className="text-[13px] text-text" data-testid="armed-version-changed">
+          {i18nT('pages.settings.aboutPanel.armed_version_changed',
+            { version: armed.versionDisplay, offered: version })}
+        </p>
+      )}
       <p className="text-[13px] text-muted">
         {i18nT('pages.settings.aboutPanel.armed_run_on_host')}
       </p>

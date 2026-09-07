@@ -12635,6 +12635,7 @@
         "last_checked_ago_next_check_in": "Zuletzt geprüft {{ago}}, nächste automatische Prüfung {{next}}.",
         "in_app_update_intro": "Die neue Version wird neben der aktuellen installiert und atomar umgeschaltet. Zum Anwenden genügt ein Freigabebefehl auf dem Gateway-Host.",
         "or_update_manually": "Oder den Installer manuell erneut ausführen",
+        "armed_version_changed": "Gerade wurde eine neuere Version gefunden, daher wird v{{version}} installiert – nicht die vor einem Moment angebotene v{{offered}}.",
         "armed_run_on_host": "Zum Freigeben und Anwenden diesen Befehl auf dem Gateway-Host ausführen.",
         "armed_expires_in": "Das Freigabefenster schließt in {{time}}",
         "armed_waiting_note": "Warte auf Freigabe — danach erscheint hier der Fortschritt und das Gateway startet sich selbst neu.",
