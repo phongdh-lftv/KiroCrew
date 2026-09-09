@@ -333,11 +333,19 @@ gap rather than presenting an HTTP 403 as an agent-driving proof.
 
 ### Agent specs + MCP servers are a SEPARATE isolation axis from the data home
 
-`KIROCREW_HOME` isolates config, DB, sessions and workspace. It does **not**
-isolate `~/.kiro/agents/*.json` — the specs that define which MCP servers exist.
-That directory is machine-wide, and a gateway rewrites its specs on every start.
+`KIROCREW_HOME` isolates config, DB, sessions and workspace. The agent specs
+(`<kiro home>/agents/*.json`, which define which MCP servers exist) live under
+kiro-cli's home, not under `KIROCREW_HOME` -- so when the data home is not the
+default one, the `kirocrew` CLI prologue also exports `KIRO_HOME=<data home>/kiro`
+(`config.paths.adopt_isolated_kiro_home`). The worktree gateway then writes its
+specs to `<data home>/kiro/agents`, its kiro-cli reads them from there, and its
+managed MCP servers (`mcp-core`, `mcp-cron`, `mcp-computer`) run the worktree's
+own code against the worktree's data home. The preview is self-contained; the
+machine-wide `~/.kiro/agents` is never touched. Session resume works because Kiro
+Crew reads transcripts through `kiro_sessions_dir()`, which follows `KIRO_HOME`.
 
-A worktree gateway is therefore **prevented from clobbering them**: you will see
+If you run a worktree gateway WITHOUT a `KIROCREW_HOME` override (on the real data
+home), the write guard refuses the shared specs instead:
 
 ```
 Refusing to rewrite the shared agent home <path> from an ephemeral instance
@@ -346,18 +354,15 @@ servers at this instance's venv and data home, and break them outright when it
 is torn down. This instance will use the existing specs instead.
 ```
 
-That warning is the guard working, not a failure. Consequence to know about: the
-preview runs against the **real install's** agents and MCP servers, so it is safe
-but not self-contained — a change to Kiro Crew's own managed MCP servers
-(`mcp-core`, `mcp-cron`, `mcp-computer`) is not exercised by a worktree preview.
-Verify those with unit tests, or temporarily point the real spec at the worktree
-and put it back afterwards.
+That warning is the guard working, not a failure -- but in that mode the preview
+runs against the **real install's** agents and MCP servers, so a change to the
+managed MCP servers is not exercised. Prefer the isolated form above.
 
-**Do not reach for `KIRO_HOME` to get around this yet.** It is kiro-cli's
-directory-wide override — it moves sessions, settings, skills and steering too,
-and Kiro Crew still reads the host paths for most of those, so setting it breaks
-session resume. Making it a real isolation switch means routing the remaining
-~two dozen `~/.kiro/**` readers through `kiro_home()` first.
+Do not export `KIRO_HOME=$HOME/.kiro` from a worktree to "share" the real specs:
+it only makes the worktree's kiro-cli READ the real install's specs (whose managed
+servers point at the real data home), and the write guard still refuses to
+rewrite them from a non-default data home -- so you get neither isolation nor a
+working preview of the managed servers.
 
 ## Rule 6 — Hands off the live plane
 
