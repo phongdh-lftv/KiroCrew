@@ -36,10 +36,15 @@ behind that facade is split by state and lifecycle ownership:
   access, and dirty-state inspection.
 - `live.py` owns live-target discovery, gateway restart backends, the Make Live lock and
   committed-cutover latch, and rollback.
+- `release_channel_pin.py` owns release-channel naming, tag-to-lane classification, and
+  lane resolution. Read-only by construction, so the fleet snapshot can resolve every lane
+  with no risk of moving a worktree; the create/advance mutations live in `worktree_ops.py`
+  because they take the same `.git` admin lock every other worktree writer takes. Its
+  fetch is additive — see Release-channel worktrees for why pruning tags is refused.
 - `fleet_state.py` owns PR/context/resource caches, fleet projections and tombstones, and
   provision reattachment state.
-- `worktree_ops.py` owns pod actions, worktree remove/sync/rebase/prune orchestration, and
-  the background task handles.
+- `worktree_ops.py` owns pod actions, worktree remove/sync/rebase/prune orchestration,
+  release-channel create/advance, and the background task handles.
 - `http_api.py` owns proxy HMAC verification, request/audit adapters, and response-shape
   translation.
 
@@ -171,6 +176,8 @@ verification. Route names below are relative to that prefix.
 | `/apps/dev-fleet/api/pod/provision` | `{name}` | Start async venv+dist build (returns `{run_id}`) |
 | `/apps/dev-fleet/api/pod/provision/dismiss` | `{name, run_id}` | Forget a terminal provision failure when the run id still matches |
 | `/apps/dev-fleet/api/rebase` | `{name}` | Rebase worktree onto origin/main |
+| `/apps/dev-fleet/api/release-channel/create` | `{lane}` | Materialize a lane's detached worktree at the channel tip (see Release-channel worktrees) |
+| `/apps/dev-fleet/api/release-channel/advance` | `{lane}` | Move that worktree to the lane's current tip |
 | `/apps/dev-fleet/api/restart-gateway` | — | Restart the live gateway through its service-manager backend; returns the pre-restart `start_id` for the restart handshake |
 | `/apps/dev-fleet/api/make-live` | `{path, dry_run?}` | Repoint the live gateway at another worktree (see Make Live); a real cutover returns `start_id` for the restart handshake |
 
@@ -186,6 +193,11 @@ dialogs in the frontend.
 - Ambiguous worktree names (multiple checkouts with same basename) return HTTP 400
 - `force` must be a boolean when provided
 - Main worktree removal is always refused regardless of force flag
+- `lane` is rejected, never sanitized, when it is not in `update_layout.RELEASE_CHANNELS`
+  (HTTP 400, `code: invalid_release_channel`). It selects a git ref and names a worktree
+  directory, so it reaches both — the same contract `update_layout.set_release_channel`
+  keeps for the same reason. Validated at the route AND in the op, because the op is also
+  reachable from the fleet's own code paths and neither layer assumes the other ran.
 
 ## Prune Rules
 
@@ -840,6 +852,131 @@ booted after something re-created the symlink (a `git clean` re-running
 dashboard still 404s while Vite rewrites it; pairing Pull+Build with Restart
 Gateway is what closes it. A process that booted against a staged real
 directory is unaffected.
+
+## Release-channel worktrees
+
+One detached worktree per published release channel, so a shipped build can be run
+and clicked through next to unreleased work. The lane vocabulary is
+`update_layout.RELEASE_CHANNELS` (`stable`, `insider`, `nightly`) — imported, not
+re-declared, because that tuple is already spelled three times in the tree and a
+fourth copy would drift.
+
+### Why a worktree per lane and not a pin on the primary checkout
+
+Sync fast-forwards the primary checkout (`git merge --ff-only`) and refuses to run
+unless HEAD is literally `BASE_BRANCH`. A stable tag is normally *behind* main, so
+pinning that checkout to a lane could only work by detaching its HEAD — which the
+sync guard rejects, and which silently repoints every `origin/main` comparison on
+the row — or by resetting `main` backwards, which destroys work. The lane therefore
+gets its own detached worktree: additive, non-destructive, and an ordinary fleet row
+that pods and Make Live already drive.
+
+### Not coupled to the update channel
+
+Nothing here reads or writes `$KIROCREW_HOME/channel`. That file says which lane the
+user's real install *follows for updates*; a pin here says which git ref a worktree
+*sits on*. Coupling them would mean materializing a stable worktree changed what the
+live install downloads next. Only vocabulary and validation are borrowed.
+
+### Naming
+
+`release-channel-<lane>`, a sibling of the primary checkout. The basename is the
+fleet row label (`Path(path).name`, verbatim) and the pod identity
+(`kirocrew-pod@release-channel-stable.service`), and it satisfies the pod name rule
+`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,60}$`. It deliberately omits the `kirocrew-wt-` prefix
+every feature worktree carries: the difference is what separates the two groups
+visually with no extra chrome. Nothing filters on that prefix — discovery is plain
+`git worktree list`, and the derived `<reponame>-wt-` prefix is only used to pick
+PR-lookup fallbacks for pre-rename repo names.
+
+### Resolution
+
+| Lane | Resolves to |
+|------|-------------|
+| `stable` | newest tag matching `v<major>.<minor>.<patch>` |
+| `insider` | newest prerelease tag (`-insider.N`, `-rc.N`, …) |
+| `nightly` | `<remote>/<BASE_BRANCH>` — `nightly.yml` builds from main HEAD and tags nothing |
+
+Ordering is by tag creation date *within* the lane, because publication order is what
+"channel tip" means. Version-sorting would require ranking `-insider.N` against
+`-rc.N`, a precedence nothing in the repo states, and would get it wrong silently.
+
+Lane membership is decided by `release_channel.channel()`, not by a second rule here:
+the module only decides whether a string is shaped like a release tag, then defers.
+The resolver then **re-checks its own answer** — the resolved version is classified
+again and a disagreement is reported as `lane_check: "mismatch"` rather than shipped,
+because serving a prerelease from a row labelled `stable` is the one silent error a
+lane pin must not make. `nightly` reports `lane_check: "untagged"` and a `null`
+version: synthesizing the `<base>-nightly.<stamp>` string the workflow would have
+stamped would put a version on screen that no artifact carries.
+
+Both mutations `git fetch --tags` **before** resolving. Tags reach the checkout on no
+other path (the fleet refresher fetches `BASE_BRANCH` only), so a resolve that ran
+first would pin a months-old release and call it the tip.
+
+The fetch is **additive, and a retracted release is a known gap**: a tag deleted
+upstream is not removed locally, so it stays resolvable as a channel tip until
+somebody deletes it by hand. Pruning is not available at an acceptable cost. Measured
+on git 2.54, `--prune-tags` does nothing in this form; the only forms that drop a
+remotely-deleted tag — `--prune --prune-tags` with no `--tags`, or an explicit
+`+refs/tags/*:refs/tags/*` under `--prune` — delete **every** local-only tag with it,
+including ones the operator authored, and a pruned tag ref is in no reflog. Buying
+retraction coverage properly means fetching release tags into a private namespace and
+resolving lanes there.
+
+### The name guard
+
+`release-channel-*` is a reserved basename, so a checkout is adopted as a lane pin
+only when it is **detached** — never on the strength of its name. A user's own branch
+checkout under that name keeps ordinary controls (including its behind-*main* count),
+the fleet reports `name_taken_by_branch`, and Advance refuses it rather than moving a
+HEAD that would abandon their branch. The frontend states this on that row rather
+than rendering a second placeholder for the same directory.
+
+### Fleet payload
+
+`release_channels` is its own top-level key, one entry per lane whether or not the
+worktree exists: `{lane, name, worktree, ref, version, lane_check, error, at_tip,
+behind, name_taken_by_branch}`. Every field has a reader: `name` is what labels the
+not-yet-created row (published so the prefix rule lives on the backend only, never
+rebuilt in the frontend), and `ref` / `version` are what the badge renders. The
+resolved commit id and the worktree's own HEAD are deliberately absent — a field
+carried "for diagnostics" that no surface shows is a contract nobody keeps. It is
+*not* extra `worktrees` rows —
+a lane with no worktree has no path, and every consumer of a `worktrees` entry (disk
+measurement, pod matching, prune candidacy) assumes one. A lane that fails to resolve
+stays in the list carrying its `error`, because an absent key and a failed key are
+indistinguishable to a caller iterating the lanes, and "never cut a stable release"
+and "git could not be read" want different words on screen. Resolution never raises:
+it rides the cached fleet snapshot, and one bad lane must not blank the fleet view.
+
+`worktree` is non-null only for an adopted tree, and `behind` / `at_tip` measure
+distance from the **lane tip**, not from `BASE_BRANCH` — the behind-main figure on a
+release worktree is large by construction and names no action, whereas distance from
+the tip is exactly what Advance would close. The frontend reuses the BEHIND column
+with that denominator and renders PR as *inapplicable* rather than as the no-PR dash.
+
+### Advance is explicit
+
+A pinned worktree never moves on its own. Automatic advancement would shift the tree
+under a pod the operator is mid-debug, and holding still until asked is the point.
+Advance refuses a dirty worktree (same gate as rebase), reports "already at the tip"
+as a success with `moved: false`, and checks out at the `strict` tier (no gateway git
+credential helpers, like rebase).
+
+It also refuses to **strand commits**, and a clean tree is not what proves there are
+none: committing is exactly what makes a worktree clean again, and a commit made on a
+detached HEAD belongs to no branch, so once HEAD moves it is reachable only from the
+reflog and only until gc. `status --porcelain` cannot see that. So Advance asks
+`rev-list --count <tip>..HEAD` and refuses while anything the tip does not contain is
+present, naming the count and telling the operator to put it on a branch. A probe that
+cannot run is also a refusal: whether anything would be lost is then unknown, and
+checking out over an unknown is how the loss happens silently.
+
+The tree moving invalidates anything already built under it, and that warning goes in
+the toast the operator is already reading rather than a payload field — the row cannot
+tell a stale `static/dist` from a fresh one, so a flag no surface renders would guard
+nothing.
 
 ## Make Live
 

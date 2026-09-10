@@ -15,7 +15,14 @@ from pathlib import Path
 from typing import Any, Callable
 
 from kiro_crew import dep_sync, frontend, hooks, platform_compat
-from kiro_crew.apps.builtins.dev_fleet import fleet_state, live, npm_preflight, repository, runtime
+from kiro_crew.apps.builtins.dev_fleet import (
+    fleet_state,
+    live,
+    npm_preflight,
+    release_channel_pin,
+    repository,
+    runtime,
+)
 from kiro_crew.executors import subprocess_executor
 from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.sandbox import sandboxed_spawn_argv, shielded_prepare_off_loop
@@ -2616,6 +2623,190 @@ async def _auto_prune_reaper() -> None:
         await asyncio.sleep(interval)
 
 
+# --- release-channel worktrees ---
+# The two mutations that move a lane's detached checkout. Resolution itself is a
+# pure read and lives in ``release_channel_pin``; these are here because they take
+# the same ``.git`` admin lock every other worktree writer in this module takes,
+# and a second module reaching for that lock is how a lock-order inversion gets
+# introduced.
+#
+# Lock order, unchanged from the removal path:
+#   _wt_lock(name)  →  _GIT_MUTATION_LOCK
+
+
+async def _release_channel_create(lane: str) -> dict:
+    """Materialize *lane*'s worktree, detached at the channel tip.
+
+    Detached on purpose. A branch would invite a ``git pull`` that drifts the
+    tree off the release it is supposed to BE, and the fleet's behind-main count
+    on a branch-bearing row would start measuring against a ref the operator
+    never chose. Detached says what the tree is: a fixed point that moves only
+    when :func:`_release_channel_advance` is asked to move it.
+    """
+    if lane not in release_channel_pin.RELEASE_CHANNELS:
+        return {"ok": False, "error": f"unknown release channel {lane!r}"}
+    try:
+        repo = repository._repo()
+    except repository.RepoUnavailable as exc:
+        return {"ok": False, "error": str(exc)}
+    name = release_channel_pin.worktree_name(lane)
+    existing, _err = await repository._find_worktree(name)
+    if existing is not None:
+        return {
+            "ok": False,
+            "error": f"{name} already exists — use Advance to move it to the channel tip",
+        }
+    path = release_channel_pin.worktree_path(repo, lane)
+    lock = _wt_lock(name)
+    if lock.locked():
+        return {"ok": False, "error": f"another {name} operation is already running"}
+    async with lock:
+        # Refuse rather than adopt. A directory already at the target path is not
+        # ours; ``git worktree add`` fails on a non-empty path anyway, and
+        # refusing here names the path instead of surfacing git's message about a
+        # directory the operator did not know was involved.
+        if await asyncio.get_running_loop().run_in_executor(
+            subprocess_executor(), Path(path).exists
+        ):
+            return {"ok": False, "error": f"refusing: {path} already exists on disk"}
+        fetch_err = await release_channel_pin.fetch_refs(repo)
+        if fetch_err:
+            return {"ok": False, "error": f"cannot refresh release refs: {fetch_err}"}
+        resolved = await release_channel_pin.resolve(lane, repo=repo)
+        if not resolved.get("ok"):
+            return resolved
+        async with _GIT_MUTATION_LOCK:
+            rc, _out, err = await runtime._run_cmd(
+                ["git", "-C", repo, "worktree", "add", "--detach", path, resolved["oid"]],
+                timeout=300,
+            )
+        if rc != 0:
+            return {
+                "ok": False,
+                "error": f"git worktree add failed: {runtime._redact((err or '').strip())[:200]}",
+            }
+    return {
+        "ok": True,
+        "lane": lane,
+        "name": name,
+        "path": runtime._redact(path),
+        "ref": resolved["ref"],
+        "version": resolved["version"],
+    }
+
+
+async def _release_channel_advance(lane: str) -> dict:
+    """Move *lane*'s existing worktree to the current channel tip.
+
+    Never automatic. A pinned worktree that moved on its own would shift under a
+    pod the operator is mid-debug, and holding still until asked is the whole
+    value of a release worktree.
+    """
+    if lane not in release_channel_pin.RELEASE_CHANNELS:
+        return {"ok": False, "error": f"unknown release channel {lane!r}"}
+    try:
+        repo = repository._repo()
+    except repository.RepoUnavailable as exc:
+        return {"ok": False, "error": str(exc)}
+    name = release_channel_pin.worktree_name(lane)
+    target, err = await repository._find_worktree(name)
+    if target is None:
+        return {"ok": False, "error": err}
+    path = target["path"]
+    lock = _wt_lock(name)
+    if lock.locked():
+        return {"ok": False, "error": f"another {name} operation is already running"}
+    async with lock:
+        # The name guard. A checkout sitting on a BRANCH is somebody's own work
+        # that happens to share the reserved name, not a lane pin — moving its
+        # HEAD would silently abandon their branch. Adoption requires the SHAPE
+        # (detached), never the name alone.
+        if (await repository._git(path, "symbolic-ref", "--quiet", "HEAD")) is not None:
+            return {
+                "ok": False,
+                "error": (
+                    f"refusing: {name} is on a branch, not detached — "
+                    "it is not a release-channel worktree"
+                ),
+            }
+        st = await repository._git(path, "status", "--porcelain")
+        if st is None:
+            return {"ok": False, "error": "cannot verify worktree state (git status failed)"}
+        if st:
+            _fields, _detail = await repository._dirt_report(path)
+            return {
+                "ok": False,
+                **_fields,
+                "error": "worktree has uncommitted changes" + _detail,
+            }
+        fetch_err = await release_channel_pin.fetch_refs(repo)
+        if fetch_err:
+            return {"ok": False, "error": f"cannot refresh release refs: {fetch_err}"}
+        resolved = await release_channel_pin.resolve(lane, repo=repo)
+        if not resolved.get("ok"):
+            return resolved
+        head = await repository._git(path, "rev-parse", "HEAD")
+        if head == resolved["oid"]:
+            # Already there. Reported as a success with ``moved: False`` rather
+            # than as an error: nothing is wrong, and a refusal here would make
+            # the UI show a failure for the state it was trying to reach.
+            return {
+                "ok": True,
+                "lane": lane,
+                "name": name,
+                "moved": False,
+                "ref": resolved["ref"],
+                "version": resolved["version"],
+            }
+        # A CLEAN tree is not the same as nothing to lose. Commits made on a
+        # detached HEAD belong to no branch, so once HEAD moves they are reachable
+        # only through the reflog and only until gc. `status --porcelain` cannot
+        # see them: it reports the worktree against HEAD, and committing is
+        # exactly what makes a worktree clean again. So ask git the question that
+        # actually matters -- is anything here NOT already contained in the tip --
+        # and refuse rather than strand it.
+        unreachable = await repository._git(
+            path, "rev-list", "--count", f"{resolved['oid']}..HEAD", timeout=12
+        )
+        if unreachable is None:
+            return {
+                "ok": False,
+                "error": "cannot verify whether this worktree has unmerged commits (git rev-list failed)",
+            }
+        if unreachable.isdigit() and int(unreachable) > 0:
+            return {
+                "ok": False,
+                "unmerged_commits": int(unreachable),
+                "error": (
+                    f"refusing to advance: {name} has {unreachable} commit(s) the "
+                    f"{lane} tip does not contain, and they are on no branch — "
+                    "advancing would leave them reachable only from the reflog. "
+                    "Move them onto a branch first (git branch <name> HEAD)."
+                ),
+            }
+        # "strict" tier: this checks out repo-controlled content, so it runs
+        # without the gateway's git credential helpers, exactly like rebase.
+        rc, _out, cerr = await runtime._run_cmd(
+            ["git", "-C", path, "checkout", "--detach", resolved["oid"]],
+            timeout=180,
+            mode="strict",
+        )
+        if rc != 0:
+            return {
+                "ok": False,
+                "error": f"git checkout failed: {runtime._redact((cerr or '').strip())[:200]}",
+            }
+    return {
+        "ok": True,
+        "lane": lane,
+        "name": name,
+        "moved": True,
+        "from_oid": head,
+        "ref": resolved["ref"],
+        "version": resolved["version"],
+    }
+
+
 __all__ = (
     "_AUTO_PRUNE_DEFAULT_INTERVAL_S",
     "_AUTO_PRUNE_MIN_INTERVAL_S",
@@ -2653,6 +2844,8 @@ __all__ = (
     "_rebase_locked",
     "_reclaim_pod_locked",
     "_refresher_task",
+    "_release_channel_advance",
+    "_release_channel_create",
     "_status_refresher",
     "_sync",
     "_sync_base_ref",

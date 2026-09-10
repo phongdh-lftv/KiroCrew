@@ -11,7 +11,14 @@ from pathlib import Path
 
 from aiohttp import web
 
-from kiro_crew.apps.builtins.dev_fleet import fleet_state, live, repository, runtime, worktree_ops
+from kiro_crew.apps.builtins.dev_fleet import (
+    fleet_state,
+    live,
+    release_channel_pin,
+    repository,
+    runtime,
+    worktree_ops,
+)
 from kiro_crew.apps.proxy_auth import raw_request_target
 
 # --- standalone backend config ---
@@ -171,7 +178,16 @@ def _audited(tool_name: str):
                     try:
                         parsed = json.loads(raw)
                         if isinstance(parsed, dict):
-                            t = parsed.get("name") or parsed.get("names") or parsed.get("path")
+                            # ``lane`` is the release-channel mutations' target.
+                            # Without it those two entries would land in the
+                            # tamper-evident trail with an EMPTY resource, which
+                            # reads as "a mutation ran against nothing".
+                            t = (
+                                parsed.get("name")
+                                or parsed.get("names")
+                                or parsed.get("path")
+                                or parsed.get("lane")
+                            )
                             if isinstance(t, str):
                                 target = t
                             elif isinstance(t, list):
@@ -480,6 +496,43 @@ async def api_dev_fleet_pod_provision_dismiss(request: web.Request) -> web.Respo
 @_audited("dev_fleet_rebase")
 async def api_dev_fleet_rebase(request: web.Request) -> web.Response:
     return await _pod_name_action(request, worktree_ops._rebase)
+
+
+async def _lane_action(request: web.Request, action) -> web.Response:
+    """Helper: validate ``lane`` against the published set, call ``action(lane)``.
+
+    The lane is REJECTED rather than sanitized, matching
+    ``update_layout.set_release_channel``: it selects a git ref and names a
+    worktree directory, so an unvalidated value would reach both. Validating
+    here as well as in the op is deliberate — the op is also reachable from the
+    fleet's own code paths, and neither layer should assume the other ran.
+    """
+    body, err = await _json_body(request, code="invalid_body")
+    if err is not None:
+        return err
+    assert body is not None
+    lane = body.get("lane")
+    if not isinstance(lane, str) or lane not in release_channel_pin.RELEASE_CHANNELS:
+        return web.json_response(
+            {
+                "error": (
+                    "'lane' must be one of " f"{', '.join(release_channel_pin.RELEASE_CHANNELS)}"
+                ),
+                "code": "invalid_release_channel",
+            },
+            status=400,
+        )
+    return web.json_response(await action(lane))
+
+
+@_audited("dev_fleet_release_channel_create")
+async def api_dev_fleet_release_channel_create(request: web.Request) -> web.Response:
+    return await _lane_action(request, worktree_ops._release_channel_create)
+
+
+@_audited("dev_fleet_release_channel_advance")
+async def api_dev_fleet_release_channel_advance(request: web.Request) -> web.Response:
+    return await _lane_action(request, worktree_ops._release_channel_advance)
 
 
 # =============================================================================
