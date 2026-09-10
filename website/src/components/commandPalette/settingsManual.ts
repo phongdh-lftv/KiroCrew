@@ -285,4 +285,18 @@ export const SETTINGS_MANUAL: ManualSettingEntry[] = [
     type: 'buttonGroup',
     occurrence: 1,
   },
+  {
+    // Model-order drag list in Settings ▸ Chat (ModelOrderCard.tsx): a
+    // reorderable model list + reset action built from custom dnd-kit markup,
+    // which the primitive extractor cannot see. 'buttonGroup' is the nearest
+    // primitive shape (a group of interactive controls); the deep link resolves
+    // by configKey to the row's data-setting-key anchor.
+    id: 'chat.model-order',
+    labelKey: 'settings.chat.modelOrder.label',
+    descriptionKey: 'settings.chat.modelOrder.description',
+    tab: 'chat',
+    type: 'buttonGroup',
+    occurrence: 1,
+    configKey: 'agent.model_order',
+  },
 ]

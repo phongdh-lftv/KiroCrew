@@ -991,6 +991,16 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "occurrence": 1
   },
   {
+    "id": "chat.model-order",
+    "labelKey": "settings.chat.modelOrder.label",
+    "tab": "chat",
+    "type": "buttonGroup",
+    "occurrence": 1,
+    "configKey": "agent.model_order",
+    "label": "Model order",
+    "description": "Drag to set the order models appear in across every picker. Auto always stays first."
+  },
+  {
     "id": "chat.pin-the-latest-turn",
     "label": "Pin the latest turn",
     "labelKey": "pages.settings.chatPanel.pin_last_prompt",

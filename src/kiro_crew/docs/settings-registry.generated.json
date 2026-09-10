@@ -579,6 +579,14 @@
       "description": "Combine follow-up messages into a single labeled prompt while the agent is busy"
     },
     {
+      "id": "chat.model-order",
+      "label": "Model order",
+      "tab": "chat",
+      "route": "/settings/chat?highlight=key%3Aagent.model_order",
+      "description": "Drag to set the order models appear in across every picker. Auto always stays first.",
+      "configKey": "agent.model_order"
+    },
+    {
       "id": "chat.pin-the-latest-turn",
       "label": "Pin the latest turn",
       "tab": "chat",
