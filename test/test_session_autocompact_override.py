@@ -933,6 +933,8 @@ class TestSlotlessDeletionClearsOverride:
         state._slots = {}  # closed tab: NO live slot for this history key
         state.crew = None
         state.remove_chat_pins_for_slots = AsyncMock()
+        state.conversation_log = MagicMock()
+        state.conversation_log.list_sessions.return_value = []
         state.sessions = MagicMock()
         state.sessions.drop_autocompact_overrides_matching = MagicMock(return_value=1)
 

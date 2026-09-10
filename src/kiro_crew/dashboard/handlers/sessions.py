@@ -28,15 +28,28 @@ from kiro_crew import session_directive, session_ledger
 from kiro_crew.acp.client import _resolve_kiro_bin_for_spawn
 from kiro_crew.config.paths import kiro_agents_dir
 from kiro_crew.dashboard import directive_queue
+from kiro_crew.dashboard.chat_utils import (
+    _history_key_for,
+    effective_session_key,
+    slot_history_key,
+)
 from kiro_crew.dashboard.handlers import kiro_usage_api
 from kiro_crew.dashboard.handlers._shared import SESSION_SEARCH_TEXT_FIELDS
 from kiro_crew.dashboard.kiro_readiness import reject_if_kiro_unverified
 from kiro_crew.dashboard.session_memory import SessionMemorySampler
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.executors import subprocess_executor
-from kiro_crew.history import SEARCH_MIN_CHARS, _archive_dir, is_incognito_transcript
+from kiro_crew.history import (
+    SEARCH_MIN_CHARS,
+    ConversationLog,
+    _archive_dir,
+    is_incognito_transcript,
+    transcript_stem,
+    transcript_stems,
+)
 from kiro_crew.llm_helpers import run_bg_oneliner
 from kiro_crew.mcp_discovery import sync_discovered_servers
+from kiro_crew.messaging.link import canonical_key
 from kiro_crew.sandbox import (
     cgroup_scope_argv,
     configured_sandbox_mode,
@@ -1297,11 +1310,11 @@ async def api_session_delete(request: web.Request) -> web.Response:
 async def _remove_slot_for_history_key(state: DashboardState, key: str) -> None:
     """Remove the active chat slot corresponding to a history key.
 
-    Slot keys may be the raw history key (``dashboard_chat-X-TS`` when
-    resumed from history) or the stripped form (``chat-X-TS`` for
-    sessions that were never closed and resumed).  Try the exact key
-    first, then the stripped variant.  Also kills the kiro-cli session
-    to prevent orphaned processes.
+    Legacy state may index a slot by the raw history key, a stripped dashboard
+    key, or a filename-folded channel key. Those spellings only locate
+    candidates; a candidate is removed only when its own transcript resolves
+    to the history file being deleted. The owning kiro-cli session is stopped
+    so it cannot recreate the deleted transcript.
     """
     from kiro_crew.dashboard.state import _normalize_slot_key
 
@@ -1311,22 +1324,126 @@ async def _remove_slot_for_history_key(state: DashboardState, key: str) -> None:
     while stripped.startswith("dashboard_"):
         stripped = stripped[len("dashboard_") :]
     normalized = _normalize_slot_key(key)
-    pin_slot_keys = {key, stripped, "dashboard_" + key, normalized}
+    candidate_slot_keys = (key, stripped, "dashboard_" + key, normalized)
+    pin_slot_keys = set(candidate_slot_keys)
 
-    slot = state._slots.pop(key, None)
-    if not slot:
-        slot = state._slots.pop(stripped, None)
-    if not slot:
-        # Reverse: history key has no prefix, but slot was stored with one
-        slot = state._slots.pop("dashboard_" + key, None)
-    if not slot:
-        # A channel-born slot's name is the key folded to the filename
-        # charset, which none of the prefix probes above produce. Without
-        # this the slot outlives its deleted history and keeps a kiro-cli
-        # process alive.
-        slot = state._slots.pop(normalized, None)
+    # The lookup spellings are aliases, not proof that the slot owns the file
+    # that was deleted. In particular, a channel key such as ``slack:a:b`` folds
+    # to the same slot spelling as a distinct dashboard conversation named
+    # ``slack_a_b``. Authorize teardown only when the candidate slot's own
+    # transcript resolves to the deleted filename stem. Canonicalizing stacked
+    # dashboard prefixes preserves the legacy duplicate-file cleanup contract;
+    # ``transcript_stems`` preserves the pre-migration bare Slack stem.
+    deleted_stem = ConversationLog._canonical_key(transcript_stem(key))
+    slot = None
+    for candidate_key in dict.fromkeys(candidate_slot_keys):
+        candidate_slot = state._slots.get(candidate_key)
+        if candidate_slot is None:
+            continue
+        owned_stems = {
+            ConversationLog._canonical_key(stem)
+            for stem in transcript_stems(slot_history_key(candidate_slot))
+        }
+        if deleted_stem not in owned_stems:
+            continue
+        slot = state._slots.pop(candidate_key, None)
+        break
     if slot:
         pin_slot_keys.add(slot.key)
+
+    # Cleanup below accepts lossy aliases because an archived channel transcript
+    # may be all the delete route has. A surviving owner makes such a fold
+    # ambiguous again. Protect exact, ledger, and filename-folded identities from
+    # both live slots and the persisted transcript catalog: a closed tab still
+    # owns resumable sidecars even though it is absent from ``state._slots``.
+    protected_exact_keys: set[str] = set()
+
+    def protect_identities(identities: set[str]) -> None:
+        exact = {identity for identity in identities if identity}
+        protected_exact_keys.update(exact)
+        protected_exact_keys.update(session_ledger.ledger_key(identity) for identity in exact)
+
+    sidecar_cleanup_safe = True
+    for surviving_slot in state._slots.values():
+        identities = {
+            identity
+            for identity in (getattr(surviving_slot, "key", ""),)
+            if isinstance(identity, str) and identity
+        }
+        for resolve_identity in (slot_history_key, effective_session_key):
+            try:
+                identity = resolve_identity(surviving_slot)
+            except Exception:
+                sidecar_cleanup_safe = False
+                logger.debug(
+                    "History delete: live owner resolution failed for %s; "
+                    "skipping independent sidecar cleanup",
+                    key,
+                    exc_info=True,
+                )
+                continue
+            if isinstance(identity, str) and identity:
+                identities.add(identity)
+        protect_identities(identities)
+
+    persisted_rows: Any = ()
+    log = getattr(state, "conversation_log", None)
+    if log is None:
+        sidecar_cleanup_safe = False
+        logger.debug(
+            "History delete: persisted owner scan failed for %s; "
+            "skipping independent sidecar cleanup",
+            key,
+        )
+    else:
+        try:
+            persisted_rows = await asyncio.to_thread(log.list_sessions)
+        except Exception:
+            sidecar_cleanup_safe = False
+            logger.debug(
+                "History delete: persisted owner scan failed for %s; "
+                "skipping independent sidecar cleanup",
+                key,
+                exc_info=True,
+            )
+
+    for row in persisted_rows:
+        owner_key = row.get("key") if isinstance(row, dict) else None
+        if not isinstance(owner_key, str) or not owner_key:
+            sidecar_cleanup_safe = False
+            logger.debug(
+                "History delete: persisted owner scan returned no key for %s; "
+                "skipping independent sidecar cleanup",
+                key,
+            )
+            continue
+        owner_stem = ConversationLog._canonical_key(owner_key)
+        owner_slot_key = _normalize_slot_key(owner_stem)
+        owner_session_key = canonical_key(owner_stem)
+        owner_identities = {
+            owner_stem,
+            owner_slot_key,
+            owner_session_key,
+            _normalize_slot_key(owner_session_key),
+        }
+        if owner_stem.startswith("dashboard_"):
+            owner_identities.add(_history_key_for(owner_slot_key))
+        protect_identities(owner_identities)
+
+    protected_folded_keys = {
+        _normalize_slot_key(identity) for identity in protected_exact_keys if identity
+    }
+
+    # A lookup alias occupied by another live or persisted owner is not stale.
+    # Without a complete owner catalog, no request spelling proves sidecar
+    # ownership: an already-folded filename stem is indistinguishable from a
+    # different closed session's slot key. Keep teardown of a matched live slot,
+    # but leave every independently persisted sidecar for a later safe cleanup.
+    if sidecar_cleanup_safe:
+        pin_slot_keys.difference_update(protected_exact_keys)
+        pin_slot_keys.difference_update(state._slots)
+    else:
+        pin_slot_keys.clear()
     try:
         await state.remove_chat_pins_for_slots(pin_slot_keys)
     except Exception:
@@ -1358,32 +1475,31 @@ async def _remove_slot_for_history_key(state: DashboardState, key: str) -> None:
             # session, so ``_history_key_for`` would name a key no session has:
             # the provider survives the delete and its next inbound message
             # recreates the transcript the user just removed.
-            from kiro_crew.dashboard.chat_utils import effective_session_key
-
             await state.sessions.destroy(effective_session_key(slot))
         except Exception:
             pass
     # The work ledger persists independently of the transcript too, and its
     # content is disposable intermediate state (nothing reconstructs from it),
-    # so a permanent delete reaps it unconditionally. Runs LAST — after the
-    # slot's turn is cancelled and its session destroyed — so an in-flight
-    # ledger write from the dying turn cannot land after the purge; a write
-    # racing in from another process can at worst recreate an orphan directory
-    # the next delete sweeps (see session_ledger.purge). Tab close
-    # (api_chat_slot_delete) deliberately does NOT reach here: the ledger is
-    # part of a session's resumable state.
+    # so a permanent delete reaps it when the owner catalog is complete. An
+    # incomplete catalog leaves every candidate set empty instead: a stale
+    # ledger is reversible, while another closed session's ledger is not.
+    # Cleanup runs LAST — after the slot's turn is cancelled and its session
+    # destroyed — so an in-flight ledger write from the dying turn cannot land
+    # after the purge; a write racing in from another process can at worst
+    # recreate an orphan directory the next safe delete sweeps (see
+    # session_ledger.purge). Tab close (api_chat_slot_delete) deliberately does
+    # NOT reach here: the ledger is part of a session's resumable state.
     ledger_candidates = set(pin_slot_keys)
-    if slot is not None:
+    if slot is not None and sidecar_cleanup_safe:
         # The AUTHORITATIVE session key: a channel-born slot runs the
         # channel's own session, whose exact key (the ledger's identity) may
         # appear in pin_slot_keys only as a folded spelling.
         try:
-            from kiro_crew.dashboard.chat_utils import effective_session_key
-
             ledger_candidates.add(effective_session_key(slot))
         except Exception:
             pass
     exact_keys = {session_ledger.ledger_key(k) for k in ledger_candidates if k}
+    exact_keys.difference_update(protected_exact_keys)
     for candidate in exact_keys:
         try:
             await asyncio.to_thread(session_ledger.purge, candidate)
@@ -1393,7 +1509,10 @@ async def _remove_slot_for_history_key(state: DashboardState, key: str) -> None:
     # session key, but a slotless delete only holds the folded transcript
     # spelling — match each ledger's breadcrumb under the same fold so the
     # exact-key ledger cannot outlive its session.
-    folded_keys = {_normalize_slot_key(k) for k in ledger_candidates if k}
+    folded_keys = (
+        {_normalize_slot_key(k) for k in ledger_candidates if k} if sidecar_cleanup_safe else set()
+    )
+    folded_keys.difference_update(protected_folded_keys)
     try:
         await asyncio.to_thread(
             session_ledger.purge_matching, exact_keys, folded_keys, _normalize_slot_key
@@ -1404,13 +1523,22 @@ async def _remove_slot_for_history_key(state: DashboardState, key: str) -> None:
     # deletion, and ``destroy()`` above only runs when a LIVE slot exists — a
     # slotless delete of archived history would otherwise leave the override
     # for a deterministic (channel) key to be silently inherited by a
-    # recreated session. Same fold-matching sweep as the ledger purge; safe to
-    # run unconditionally (the slot path's destroy already popped its entry).
+    # recreated session. Same fold-matching sweep as the ledger purge. The call
+    # remains unconditional, but an incomplete owner catalog supplies empty
+    # exact and folded sets, so no independent sidecar is removed.
     try:
-        raw_candidates = set(pin_slot_keys) | {key}
+        raw_candidates = set(pin_slot_keys)
+        if sidecar_cleanup_safe:
+            raw_candidates.add(key)
+        override_exact_keys = (raw_candidates | folded_keys) - protected_exact_keys
+        override_folded_keys = (
+            ({_normalize_slot_key(k) for k in raw_candidates} | folded_keys) - protected_folded_keys
+            if sidecar_cleanup_safe
+            else set()
+        )
         dropped = state.sessions.drop_autocompact_overrides_matching(
-            raw_candidates | folded_keys,
-            {_normalize_slot_key(k) for k in raw_candidates} | folded_keys,
+            override_exact_keys,
+            override_folded_keys,
             _normalize_slot_key,
         )
         if dropped:

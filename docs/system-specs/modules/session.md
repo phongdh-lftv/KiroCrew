@@ -1077,6 +1077,23 @@ second form hits the dedup guard). When normalization changes the name, the
 original pretty form is preserved as the slot's initial title
 (redaction-scrubbed, non-pinned so auto-title can still override).
 
+**Permanent history deletion keeps sidecar ownership exact.**
+`DELETE /api/sessions/{key}` unlinks the selected transcript first, then
+`_remove_slot_for_history_key` reaps its chat pins, work ledger, and per-session
+autocompact override. A filename fold may locate candidates, but it is not proof
+that those sidecars belong to the deleted transcript. The cleanup protects
+identities from both live slots and every surviving row returned by
+`ConversationLog.list_sessions()`; the latter are closed sessions that still own
+resumable state despite being absent from `state._slots`. A bare legacy Slack
+`thread_ts` owner protects both `slack:<thread_ts>` and its `slack_<thread_ts>`
+filename fold. The catalog scan runs off the event loop and reuses the history
+store's existing enumeration rather than maintaining a second owner index. If
+that catalog or a live owner cannot be resolved, a transcript-matched live slot
+may still be stopped, but every independent chat-pin, work-ledger, and override
+cleanup set is empty. A request spelling is not ownership proof, even when the
+filename fold leaves it unchanged. Leaving a stale sidecar is reversible;
+deleting another session's state is not.
+
 ## Slack Thread Linking
 
 Sessions can be linked to Slack threads via `SessionMap` fields
