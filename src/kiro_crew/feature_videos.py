@@ -7,35 +7,56 @@ changes every six hours. A video is a shipped artifact — a recorded clip with 
 title and a poster — so nothing about it can be generated at request time, and
 "which one do I show" has exactly one right answer for a given install state.
 
-That makes the rule set DETERMINISTIC:
+That makes ELIGIBILITY deterministic:
 
-* the catalog is a static tuple in this module (:data:`CATALOG`), not a doc scan
-  and not an LLM call;
-* selection walks the catalog in order and returns the FIRST entry that is
-  eligible, so two requests one second apart cannot disagree;
+* the catalog is DATA, never generated at request time — a signed manifest
+  published per release (:mod:`kiro_crew.feature_videos_manifest`), with the
+  static tuple in this module (:data:`CATALOG`) as the fallback for an install
+  that has never fetched one;
 * "has the user already used this feature?" is answered by named probes
   (:data:`_PROBES` / :data:`_PARAM_PROBES`) that read local state, never by a
-  model's guess.
+  model's guess;
+* a clip is only offered once its media is actually on this machine, or — when
+  nothing is cached yet — from the one CDN host the signed manifest names.
+
+WHICH of several equally-eligible clips gets shown is RANDOM (:func:`select_next`).
+Not because order starves a clip — it does not, since a verdict is permanent and
+each launch retires the clip it showed, so a fixed order reaches the whole library
+too. The draw is about the LIBRARY rather than one install: publication order is
+the same for everyone, so a deterministic pick shows every install the same first
+clip, and the newest entry is the last thing anybody sees. Drawing uniformly
+spreads first impressions across the set, which is what makes early feedback on a
+new clip arrive at all. Nothing about ELIGIBILITY is random, so a video the user
+has retired, or one for a feature they already use, still cannot appear.
 
 Both statuses a user can record (``seen`` / ``dismissed``) are PERMANENT. There
 is no snooze, because a feature intro is not a recurring nudge: once it has been
 watched or waved away, showing it again is noise.
 
-Asset paths are same-origin relative paths under ``/app-assets/feature-videos/``
-and are validated as such (:func:`validate_asset_path`). Downloading a clip from
-a remote origin is a separate, future change — see the note in that function for
-the single place the rule would relax.
+Three source shapes reach a client, and :func:`validate_asset_path` is the one
+gate for all of them: a bundled clip under ``/app-assets/feature-videos/``, a
+cached clip under ``/feature-videos/<release>/`` served from the data home, and —
+only when nothing is cached yet — an absolute ``https://`` url whose host must
+equal the one the signed manifest declares. That host pin is the whole relaxation
+of the original same-origin rule: it comes from a signed document, never from
+config and never from the entry.
 """
 
 from __future__ import annotations
 
 import asyncio
+import http.client
 import json
 import logging
 import math
 import os
+import random
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
@@ -43,6 +64,9 @@ from typing import TYPE_CHECKING, Callable
 from aiohttp import web
 
 import kiro_crew
+from kiro_crew import asset_downloader
+from kiro_crew import feature_videos_cache as cache_mod
+from kiro_crew import feature_videos_manifest as manifest_mod
 from kiro_crew.apps.version import parse_version
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.loader import KiroCrewConfig, config_local_path, config_path
@@ -63,6 +87,22 @@ logger = logging.getLogger(__name__)
 #: Every shipped clip and poster lives under this same-origin prefix, served
 #: from ``website/public/app-assets/`` like every other bundled app asset.
 ASSET_PREFIX = "/app-assets/feature-videos/"
+
+#: The two same-origin prefixes a clip may be served from: bundled assets inside
+#: the wheel, and downloaded clips in the user's data home
+#: (``feature_videos_cache.SERVE_PREFIX``). Two prefixes rather than one tree
+#: because the trees have different owners and different lifetimes — a route over
+#: the data home must never be reachable through the bundled-asset prefix.
+_SAME_ORIGIN_PREFIXES = (ASSET_PREFIX, cache_mod.SERVE_PREFIX)
+
+#: Media suffixes a validated url may end in. An allowlist, so a manifest cannot
+#: put ``.html`` (or an extensionless path) behind a ``<video src>``.
+_MEDIA_SUFFIXES = (".mp4", ".jpg", ".jpeg", ".png", ".webp")
+
+#: Timeout for the remote half of ``/api/feature-videos/probe``. Short on purpose:
+#: the client is waiting on a yes/no about one url, and a slow answer is a "no"
+#: worth giving quickly.
+_PROBE_TIMEOUT_SECS = 3
 
 #: Bound on a CATALOG entry's ``id``. The feedback route does not use it: there,
 #: catalog membership is the tighter check and already closes the state file's
@@ -124,63 +164,96 @@ class VideoEntry:
     #: a feature that does not exist on this build must not be offered.
     min_version: str = ""
 
-    def payload(self) -> dict[str, object]:
-        """The client-facing shape: everything except the probe signals.
-
-        ``used_when`` is withheld on purpose. It names local state the frontend
-        has no business reading, and shipping it would invite a client to
-        re-evaluate eligibility itself and drift from this module's answer.
-        """
-        return {
-            "id": self.id,
-            "feature": self.feature,
-            "title": self.title,
-            "description": self.description,
-            "src": self.src,
-            "poster": self.poster,
-            "duration_s": self.duration_s,
-            "doc": self.doc,
-            "min_version": self.min_version,
-        }
+    # No ``payload()`` here on purpose. A catalog entry is not what reaches a
+    # client: the client-facing shape is :meth:`Offer.payload`, which carries the
+    # resolved ``source`` and ``src`` a bundled entry cannot state on its own. Two
+    # payload builders would be two chances for the hosted and bundled shapes to
+    # drift, and only one of them is ever serialized.
 
 
-def validate_asset_path(value: object) -> str:
-    """Return *value* if it is a safe same-origin asset path, else ``""``.
+def validate_asset_path(value: object, *, allowed_hosts: "frozenset[str]" = frozenset()) -> str:
+    """Return *value* if it is a safe clip source, else ``""``.
 
     A video element's ``src`` is fetched by the browser with the dashboard's own
     credentials, so an attacker-controlled value here is an outbound request the
-    user authorized without knowing it. Everything that could redirect the fetch
-    off this origin, or walk out of the asset directory, is refused:
+    user authorized without knowing it. This is the ONE function every source
+    reaches the client through — bundled, cached and remote alike.
+
+    Same-origin case (no *allowed_hosts*, or a value that is not an https url).
+    Everything that could redirect the fetch off this origin, or walk out of the
+    asset directory, is refused:
 
     * a scheme (``http:``, ``data:``, ``javascript:``) — any ``:`` at all, which
       also catches a Windows drive letter;
     * a protocol-relative ``//`` prefix, and any ``//`` elsewhere (an empty path
-      segment is never meaningful for a bundled asset);
+      segment is never meaningful for an asset);
     * ``..`` in any form, plus ``%`` so a percent-encoded ``%2e%2e`` cannot
       reconstitute one after the browser decodes it;
     * a backslash, which some clients normalize to ``/``;
-    * anything outside :data:`ASSET_PREFIX`.
+    * anything outside :data:`_SAME_ORIGIN_PREFIXES`.
+
+    Remote case, which is the relaxation the same-origin rule always reserved for
+    hosted clips: an ``https://`` url is accepted ONLY when its host is in
+    *allowed_hosts*, which callers derive from the signed manifest's own
+    ``cdn_base`` — never from config and never from the entry. On top of the host
+    pin the url must carry no userinfo (which would be a credential in a
+    ``src``), no query or fragment (which is where a presigned credential or a
+    redirect parameter would ride), no explicit port, and a path that passes the
+    same traversal rules plus a media-suffix allowlist. An empty *allowed_hosts*
+    means no remote source is acceptable at all, which is what makes "the ceiling
+    denied downloading" express itself as "no remote clip" without a second
+    branch at the caller.
 
     Returns the empty string rather than raising: a bad path in the shipped
-    catalog is a bug, but it must degrade to "this entry is not offered" rather
-    than 500 every ``/api/feature-videos/*`` request until it is fixed.
-
-    Cloud-hosted clips are a future change. When they land, the relaxation goes
-    HERE and nowhere else: accept an ``https://`` URL whose host is on an
-    explicit allowlist, keep rejecting every other scheme, and keep the
-    traversal rules for the relative case. Do not relax the caller instead —
-    every entry reaches the client through this one function.
+    catalog, or in a manifest, is a bug — but it must degrade to "this entry is
+    not offered" rather than 500 every ``/api/feature-videos/*`` request until it
+    is fixed.
     """
     if not isinstance(value, str) or not value:
         return ""
+    if value.lower().startswith("https://"):
+        return _validate_remote_asset_url(value, allowed_hosts)
     if ":" in value or "//" in value or ".." in value or "%" in value or "\\" in value:
         return ""
     if any(ch.isspace() or ord(ch) < 0x20 for ch in value):
         return ""
-    if not value.startswith(ASSET_PREFIX):
+    for prefix in _SAME_ORIGIN_PREFIXES:
+        # Longer than the prefix: a value equal to the prefix is the directory
+        # itself, with no filename.
+        if value.startswith(prefix) and len(value) > len(prefix):
+            return value
+    return ""
+
+
+def _validate_remote_asset_url(value: str, allowed_hosts: "frozenset[str]") -> str:
+    """Return *value* if it is an https url on an allowed host, else ``""``."""
+    if not allowed_hosts:
         return ""
-    # A trailing slash means the prefix itself was passed with no filename.
-    if len(value) <= len(ASSET_PREFIX):
+    if any(ch.isspace() or ord(ch) < 0x20 for ch in value):
+        return ""
+    try:
+        parts = urllib.parse.urlsplit(value)
+    except ValueError:
+        return ""
+    if parts.scheme != "https":
+        return ""
+    if parts.username or parts.password:
+        return ""
+    try:
+        if parts.port is not None:
+            return ""
+    except ValueError:
+        # An unparseable port in the authority. Refusing beats guessing which
+        # host a client would end up resolving.
+        return ""
+    if (parts.hostname or "").lower() not in allowed_hosts:
+        return ""
+    if parts.query or parts.fragment:
+        return ""
+    path = parts.path
+    if not path.startswith("/") or ".." in path or "%" in path or "//" in path or "\\" in path:
+        return ""
+    if not path.lower().endswith(_MEDIA_SUFFIXES):
         return ""
     return value
 
@@ -579,23 +652,361 @@ def _version_ok(min_version: str, running: str) -> bool:
         return True
 
 
-def select_next(running_version: str) -> VideoEntry | None:
-    """First eligible catalog entry, or None. Blocking — call off the loop.
+#: Where a clip's bytes come from, as reported to the client. ``local`` covers
+#: both same-origin cases — a bundled asset and a downloaded one — because from
+#: the browser's side they are the same fetch against this origin, and a client
+#: that had to tell them apart would be re-deriving a server decision. ``remote``
+#: is the one case where the media comes from the CDN.
+SOURCE_LOCAL = "local"
+SOURCE_REMOTE = "remote"
 
-    Order is the catalog's own order, so the answer is stable across requests.
-    Probes are evaluated LAST and lazily: they are the only expensive part, and
-    an entry already ruled out by state or version must not pay for them.
+#: How many recently-offered ids stay acceptable for a verdict. Bounded because
+#: this is the ONE thing keeping the state file's key set closed: a verdict may name
+#: a known clip or one of the last few offered, and nothing else. 64 is far more
+#: than the one dialog a user can have open, and small enough that the set cannot
+#: become a store.
+_ISSUED_ID_LIMIT = 64
+
+#: Ids ``/next`` has handed out, newest last. A clip can leave the catalog between
+#: ``/next`` and the user's click — a background manifest refresh replaces the
+#: catalog, and the clip they are looking at may not be in the new one. Without this
+#: the feedback POST answers 400 and the verdict is DISCARDED, so the permanent
+#: "do not show me this again" the user just expressed is lost and the clip returns.
+#: Process-wide, and about the machine's own recent offers rather than any caller.
+_issued_ids: "OrderedDict[str, float]" = OrderedDict()
+
+#: Guards :data:`_issued_ids`. A threading lock, not an asyncio one: both routes
+#: touch it from executor THREADS.
+_issued_lock = threading.Lock()
+
+
+def _remember_issued(video_id: str) -> None:
+    """Record that ``/next`` offered *video_id*, evicting the oldest past the cap."""
+    if not video_id:
+        return
+    with _issued_lock:
+        _issued_ids.pop(video_id, None)
+        _issued_ids[video_id] = time.time()
+        while len(_issued_ids) > _ISSUED_ID_LIMIT:
+            _issued_ids.popitem(last=False)
+
+
+def _was_issued(video_id: str) -> bool:
+    """Whether *video_id* is one of the recently offered ids."""
+    with _issued_lock:
+        return video_id in _issued_ids
+
+
+def _forget_issued(video_id: str) -> None:
+    """Drop *video_id* once its verdict is recorded — the row on disk supersedes it."""
+    with _issued_lock:
+        _issued_ids.pop(video_id, None)
+
+
+#: The selector's randomness source, as an instance rather than the ``random``
+#: module functions, so a test can pin it (``monkeypatch.setattr(fv, "_rng",
+#: random.Random(0))``) without reseeding global randomness for everything else
+#: in the process. Not ``secrets``: which intro clip plays is not a secret, and a
+#: CSPRNG here would imply it was.
+_rng = random.Random()
+
+
+@dataclass(frozen=True)
+class Offer:
+    """One clip that could be shown right now, with the source resolved.
+
+    The union of what a bundled :class:`VideoEntry` and a hosted
+    :class:`~kiro_crew.feature_videos_manifest.ManifestEntry` have in common,
+    plus the two things only the server can answer: WHERE the bytes are
+    (:attr:`source`) and the exact ``src`` for that source. Eligibility and
+    payload logic run on this one shape, so a hosted clip and a bundled clip
+    cannot drift into two different rule sets.
+    """
+
+    id: str
+    feature: str
+    title: str
+    description: str
+    src: str
+    poster: str
+    duration_s: float
+    doc: str
+    min_version: str
+    used_when: tuple[str, ...]
+    source: str
+
+    def payload(self) -> dict[str, object]:
+        """The client-facing shape.
+
+        ``used_when`` is withheld on purpose. It names local state the frontend
+        has no business reading, and shipping it would invite a client to
+        re-evaluate eligibility itself and drift from this module's answer.
+        """
+        return {
+            "id": self.id,
+            "feature": self.feature,
+            "title": self.title,
+            "description": self.description,
+            "src": self.src,
+            "poster": self.poster,
+            "duration_s": self.duration_s,
+            "doc": self.doc,
+            "min_version": self.min_version,
+            "source": self.source,
+        }
+
+
+def _bundled_offers() -> tuple[Offer, ...]:
+    """Offers from the static catalog — the fallback for a manifest-less install."""
+    return tuple(
+        Offer(
+            id=entry.id,
+            feature=entry.feature,
+            title=entry.title,
+            description=entry.description,
+            src=entry.src,
+            poster=entry.poster,
+            duration_s=entry.duration_s,
+            doc=entry.doc,
+            min_version=entry.min_version,
+            used_when=entry.used_when,
+            source=SOURCE_LOCAL,
+        )
+        for entry in offerable()
+    )
+
+
+def _hosted_offers(
+    manifest: "manifest_mod.VideoManifest", *, allow_remote: bool
+) -> tuple[tuple[Offer, ...], tuple[Offer, ...]]:
+    """``(cached, remote)`` offers from a verified manifest. Blocking (stats files).
+
+    A cached entry produces a same-origin offer only; an uncached one produces a
+    remote offer only. The two lists are returned separately rather than merged
+    because the caller must prefer local: a clip already on disk plays instantly
+    and costs no egress, so reaching for the CDN while a cached clip is eligible
+    would be a worse answer to the same question.
+
+    *allow_remote* False (the ceiling denied downloading) is expressed by handing
+    :func:`validate_asset_path` an EMPTY host allowlist, not by skipping the
+    branch. One code path, and the host pin is what refuses the url either way.
+    """
+    hosts: frozenset[str] = (
+        frozenset(h for h in (manifest.cdn_host,) if h) if allow_remote else frozenset()
+    )
+    cached: list[Offer] = []
+    remote: list[Offer] = []
+    for entry in manifest.entries:
+        if cache_mod.is_cached(entry, manifest.release):
+            src = validate_asset_path(f"{cache_mod.SERVE_PREFIX}{manifest.release}/{entry.file}")
+            poster = validate_asset_path(cache_mod.poster_url_path(entry, manifest.release))
+            bucket, source = cached, SOURCE_LOCAL
+        else:
+            src = validate_asset_path(manifest.asset_url(entry.file), allowed_hosts=hosts)
+            poster = validate_asset_path(manifest.asset_url(entry.poster), allowed_hosts=hosts)
+            bucket, source = remote, SOURCE_REMOTE
+        if not src or not poster:
+            continue
+        bucket.append(
+            Offer(
+                id=entry.id,
+                feature=entry.feature,
+                title=entry.title,
+                description=entry.description,
+                src=src,
+                poster=poster,
+                duration_s=entry.duration_s,
+                doc=entry.doc,
+                min_version=entry.min_version,
+                used_when=entry.used_when,
+                source=source,
+            )
+        )
+    return tuple(cached), tuple(remote)
+
+
+def _eligible(offer: Offer, st: FeatureVideoState, running_version: str) -> bool:
+    """Whether *offer* may be shown. Probes LAST and lazily.
+
+    Probes are the only expensive part, so an offer already ruled out by recorded
+    state or by the version floor must not pay for them.
+    """
+    if st.status_of(offer.id):
+        return False
+    if not _version_ok(offer.min_version, running_version):
+        return False
+    return not any(probe_fires(signal) for signal in offer.used_when)
+
+
+def _offer_pools(running_version: str) -> tuple[tuple[Offer, ...], tuple[Offer, ...]]:
+    """``(preferred, fallback)`` eligible pools, in the order they may be drawn from.
+
+    See :func:`_offer_pools_and_permit`; this is the same answer without the
+    download permit, for callers that only need to know what is on offer.
+    """
+    preferred, fallback, _permit = _offer_pools_and_permit(running_version)
+    return preferred, fallback
+
+
+def _offer_pools_and_permit(
+    running_version: str,
+) -> tuple[tuple[Offer, ...], tuple[Offer, ...], bool]:
+    """``(preferred, fallback, download_enabled)``: the eligible pools, in the order
+    they may be drawn from, and whether this install may pull clip bytes at all.
+
+    One place decides which catalog is in force, so selection and the probe route
+    cannot disagree about what is on offer. A verified manifest REPLACES the
+    static catalog rather than extending it: mixing them would offer a bundled
+    clip and its hosted successor as two videos, and a user retiring one would
+    still be shown the other.
+
+    The permit travels WITH the pools because the modal reads it beside the offer
+    (``download_enabled`` on ``/next``) and fails closed on a remote clip without
+    it. Reporting it from the same evaluation that built the pools means the two
+    cannot disagree — a remote offer is never handed back beside ``False``, and
+    a second evaluation for the readout would be a second audit row for one
+    decision.
     """
     st = load_state()
-    for entry in offerable():
-        if st.status_of(entry.id):
-            continue
-        if not _version_ok(entry.min_version, running_version):
-            continue
-        if any(probe_fires(signal) for signal in entry.used_when):
-            continue
-        return entry
+    current = cache_mod.feature_video_cache().current_manifest()
+    if current is None:
+        pool = tuple(o for o in _bundled_offers() if _eligible(o, st, running_version))
+        # No hosted catalog, so no remote offer exists and this answer authorizes
+        # nothing. The memo is enough here, as it is for /status: spending an
+        # audited decision on a readout is the split this module avoids.
+        return pool, (), bool(manifest_mod.download_permitted_cached())
+    # The AUDITED answer, not the memo. Handing back a remote offer authorizes
+    # egress: the browser fetches that url from the CDN itself, so there is no
+    # later transfer of ours to re-check it. A memo up to one TTL stale would let
+    # a denial be answered with a CDN url for the rest of that window. The memo
+    # stays where a stale answer costs only a readout — /status's display field
+    # and the CSP header builder, which cannot block at all.
+    allow_remote = not download_denied_now()
+    cached, remote = _hosted_offers(current, allow_remote=allow_remote)
+    return (
+        tuple(o for o in cached if _eligible(o, st, running_version)),
+        tuple(o for o in remote if _eligible(o, st, running_version)),
+        allow_remote,
+    )
+
+
+def select_next(running_version: str) -> "Offer | None":
+    """One eligible clip at random, or None. Blocking — call off the loop.
+
+    Local before remote: a cached clip plays without egress and without a
+    spinner, so the CDN is only reached when nothing eligible is on disk yet.
+    Within a pool the pick is uniform — see the module docstring for why order
+    stopped being the right rule once the library grew.
+    """
+    offer, _permit = select_next_and_permit(running_version)
+    return offer
+
+
+def select_next_and_permit(running_version: str) -> "tuple[Offer | None, bool]":
+    """:func:`select_next` plus the download permit the draw was made under.
+
+    For ``/next``, which reports the permit beside the offer. One evaluation
+    serves both, so the response can never pair a remote clip with
+    ``download_enabled: false`` — the combination the modal refuses to open.
+    """
+    preferred, fallback, permit = _offer_pools_and_permit(running_version)
+    pool = preferred or fallback
+    return (_rng.choice(list(pool)) if pool else None), permit
+
+
+def find_offer(video_id: str, running_version: str) -> "Offer | None":
+    """The offer for *video_id* as the selector would resolve it, or None.
+
+    Shares :func:`_offer_pools` with selection deliberately: the probe route must
+    answer about the source the client was actually handed, and re-deriving it
+    from the id would be a second answer to the same question.
+    """
+    for pool in _offer_pools(running_version):
+        for offer in pool:
+            if offer.id == video_id:
+                return offer
     return None
+
+
+def known_video_ids() -> set[str]:
+    """Every id a verdict may be recorded against. Blocking.
+
+    The union of the static catalog and the current manifest, NOT just whichever
+    one selection is using: a user who was shown a bundled clip before a manifest
+    landed must still be able to record a verdict on it, and the recorded id is
+    what keeps that clip retired afterwards.
+    """
+    ids = {entry.id for entry in catalog()}
+    current = cache_mod.feature_video_cache().current_manifest()
+    if current is not None:
+        ids |= {entry.id for entry in current.entries}
+    return ids
+
+
+def probe_offer(offer: Offer) -> bool:
+    """Whether *offer*'s ``src`` can actually be fetched right now. Blocking.
+
+    Server-side, because the point is to answer BEFORE the dialog opens: the
+    modal's ``<video>`` is ``preload="none"``, so a client cannot discover a dead
+    src until the user presses play — and by then the natural "Got it" records a
+    PERMANENT verdict against a clip nobody saw.
+
+    A local src is a stat. A remote src is a ``HEAD``, and only to the host the
+    signed manifest already authorized — the url reaching this function has been
+    through :func:`validate_asset_path`, so the request cannot be aimed anywhere
+    else. Any failure answers False: the caller's next step on False is to not
+    offer the clip, which is the safe direction.
+    """
+    if offer.source == SOURCE_REMOTE:
+        return _probe_remote(offer.src)
+    if offer.src.startswith(ASSET_PREFIX):
+        return _asset_exists(offer.src)
+    tail = offer.src[len(cache_mod.SERVE_PREFIX) :]
+    release, _, name = tail.partition("/")
+    return cache_mod.resolve_served_path(release, name) is not None
+
+
+def download_denied_now() -> bool:
+    """The audited download decision. Blocking — never call on the event loop.
+
+    A one-line alias so an action site reads as a decision rather than as a
+    module reach-through, and so the audited and memoized reads cannot be
+    confused for one another at a glance.
+    """
+    return bool(manifest_mod.download_denied())
+
+
+def _probe_remote(url: str) -> bool:
+    """HEAD *url* and report whether the object is there. Never raises.
+
+    The gate lives HERE rather than at each caller: this function is the one place
+    an outbound request leaves, so every route that probes — /probe and eligibility
+    alike — is covered by one check instead of one per caller. A probe is egress, so
+    it takes the audited answer; False is the safe direction, and the caller's next
+    step on False is to not offer the clip.
+    """
+    if download_denied_now():
+        return False
+    try:
+        request = urllib.request.Request(url, method="HEAD")
+        # build_opener, never urlopen: validate_asset_path pinned this url to the
+        # signed manifest's host, and urlopen's default handler would follow a
+        # redirect straight off it.
+        opener = asset_downloader.build_opener()
+        # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected -- validate_asset_path pinned the https host to the signed manifest's cdn_base and redirects are host-pinned
+        with opener.open(request, timeout=_PROBE_TIMEOUT_SECS) as resp:
+            return 200 <= int(getattr(resp, "status", 0) or 0) < 300
+    except (
+        urllib.error.URLError,
+        OSError,
+        TimeoutError,
+        ValueError,
+        http.client.HTTPException,
+    ):
+        # http.client.InvalidURL / BadStatusLine derive from HTTPException, which is
+        # neither an OSError nor a ValueError. A malformed reply from an allowed CDN
+        # would otherwise escape a "never raises" helper and 500 the probe route.
+        return False
 
 
 # ── HTTP handlers ──
@@ -608,11 +1019,23 @@ def _enabled() -> bool:
 async def api_feature_videos_next(request: web.Request) -> web.Response:
     """GET /api/feature-videos/next — the next intro clip to play, or null.
 
-    Returns ``{"video": <entry-without-used_when> | null, "enabled": <bool>}``.
+    Returns ``{"video": <offer-without-used_when> | null, "enabled": <bool>,
+    "download_enabled": <bool>}``, where the offer carries ``source`` (``local``
+    or ``remote``) and the ``src`` for that source — resolved here so a client
+    never has to guess whether a clip is on disk.
 
     ``enabled`` is reported even when it is false, rather than a 204: the
     settings panel and the modal both need to tell "the operator turned this
     off" apart from "nothing left to show", and a bodiless response cannot.
+
+    ``download_enabled`` is whether this install may pull clip bytes at all,
+    read from the same evaluation that chose the offer. The modal fails closed
+    on a remote clip unless it is exactly ``true`` (``StartupVideoModal``), so
+    a remote offer without it would never play. It is reported only where an
+    offer could have been made: the kill-switch and restricted-session answers
+    carry no clip to gate, and evaluating the download ceiling for them would
+    spend a governance read on every dashboard load of an install that has the
+    feature off.
     """
     state: DashboardState = request.app["state"]
     loop = asyncio.get_running_loop()
@@ -628,35 +1051,91 @@ async def api_feature_videos_next(request: web.Request) -> web.Response:
     if _is_restricted_session(state, request):
         return web.json_response({"video": None, "enabled": True})
 
-    entry = await loop.run_in_executor(None, select_next, kiro_crew.__version__)
-    return web.json_response({"video": entry.payload() if entry else None, "enabled": True})
+    entry, download_enabled = await loop.run_in_executor(
+        None, select_next_and_permit, kiro_crew.__version__
+    )
+    if entry is not None:
+        # The catalog can change under the open dialog, so the id is remembered
+        # until its verdict lands (:data:`_issued_ids`). Otherwise a refresh between
+        # here and the user's click makes the feedback POST a 400 and throws away a
+        # verdict they will not be asked for again.
+        _remember_issued(entry.id)
+    return web.json_response(
+        {
+            "video": entry.payload() if entry else None,
+            "enabled": True,
+            "download_enabled": download_enabled,
+        }
+    )
 
 
 async def api_feature_videos_status(request: web.Request) -> web.Response:
-    """GET /api/feature-videos/status — kill-switch state plus the whole state map.
+    """GET /api/feature-videos/status — switches, cache progress, and the state map.
 
-    Returns ``{"enabled": <bool>, "state": {<id>: {"status", "ts"}}}`` for the
-    settings panel, which needs to render (and later reset) what has been seen.
+    Returns ``{"enabled", "download_enabled", "release", "cached", "total",
+    "downloading", "download_state", "state"}`` for the settings panel, which
+    needs to render (and later reset) what has been seen, and to show whether the
+    hosted library has finished arriving.
 
-    The state map is a READ of engagement history, so it is gated by
-    ``_blocks_reads_session`` rather than ``_is_restricted_session``. That is the
-    product's own read/write split, not a looser gate: incognito withholds
-    WRITES, and a temporary session withholds reads as well. ``/next`` uses the
-    broader predicate because reaching it leads to a permanent write, while this
-    route only reads — so an incognito session still renders its own settings
-    panel, and only a read-blocking session is served an empty map.
+    ``state`` keeps its original meaning — the ``{<id>: {"status", "ts"}}``
+    engagement map — and the transfer's own step is reported separately as
+    ``download_state``. Renaming would have been the smaller diff here and the
+    larger break: ``state`` is what the settings panel already reads.
 
-    ``enabled`` is reported truthfully either way: the kill switch is instance
-    configuration, not history, and withholding it would make the panel claim
-    the feature is off.
+    Only ``state`` is history. It is gated by ``_blocks_reads_session`` rather
+    than ``_is_restricted_session``: that is the product's own read/write split,
+    not a looser gate — incognito withholds WRITES, and a temporary session
+    withholds reads as well. ``/next`` uses the broader predicate because reaching
+    it leads to a permanent write, while this route only reads, so an incognito
+    session still renders its own settings panel and only a read-blocking session
+    is served an empty map.
+
+    Every other field is instance configuration or cache bookkeeping, reported
+    truthfully to every session: withholding them would make the panel claim the
+    feature is off, or that nothing has downloaded.
     """
     state: DashboardState = request.app["state"]
     loop = asyncio.get_running_loop()
+    cache = cache_mod.feature_video_cache()
     enabled = await loop.run_in_executor(None, _enabled)
+    # Cached, not audited: this route is polled while a download runs, and one SEL
+    # row per poll would bury the rows that record a real decision.
+    download_enabled = await asyncio.to_thread(manifest_mod.download_permitted_cached)
+    current = await asyncio.to_thread(cache.current_manifest)
+    cached, total = await asyncio.to_thread(cache.counts)
+    body: dict[str, object] = {
+        "enabled": enabled,
+        "download_enabled": download_enabled,
+        "release": current.release if current is not None else "",
+        "cached": cached,
+        "total": total,
+        "downloading": cache.status.get("downloading"),
+        "download_state": cache.status.get("download_state"),
+        "state": {},
+    }
     if _blocks_reads_session(state, request):
-        return web.json_response({"enabled": enabled, "state": {}})
+        return web.json_response(body)
     st = await loop.run_in_executor(None, load_state)
-    return web.json_response({"enabled": enabled, "state": st.videos})
+    body["state"] = st.videos
+    return web.json_response(body)
+
+
+async def api_feature_videos_probe(request: web.Request) -> web.Response:
+    """GET /api/feature-videos/probe?id=<id> — is this clip's src actually fetchable?
+
+    Returns ``{"ok": <bool>}``. An unknown id, a clip the selector would not
+    offer, and a src that does not answer all report ``ok: false`` from one shape:
+    the client's decision on False is the same in every case (do not open the
+    dialog), and telling them apart would only invite the client to act on the
+    difference.
+    """
+    video_id = request.query.get("id", "")
+    if not isinstance(video_id, str) or not video_id:
+        return web.json_response({"ok": False})
+    offer = await asyncio.to_thread(find_offer, video_id, kiro_crew.__version__)
+    if offer is None:
+        return web.json_response({"ok": False})
+    return web.json_response({"ok": await asyncio.to_thread(probe_offer, offer)})
 
 
 async def api_feature_videos_feedback(request: web.Request) -> web.Response:
@@ -665,10 +1144,18 @@ async def api_feature_videos_feedback(request: web.Request) -> web.Response:
     Body: ``{"id": <catalog id>, "status": "seen" | "dismissed"}``.
 
     Both statuses are terminal: there is no snooze, so a recorded video is never
-    offered again. The id must name a CATALOG entry — an unknown id is a client
-    bug, and accepting it would let an unbounded set of keys accumulate in the
-    state file forever. That membership check is the only id validation, since
-    it is strictly tighter than any length or shape bound.
+    offered again. The id must name a known clip (:func:`known_video_ids`, the union
+    of the static catalog and the current manifest) OR one ``/next`` offered
+    recently (:data:`_issued_ids`) — an id from neither is a client bug, and
+    accepting it would let an unbounded set of keys accumulate in the state file
+    forever. Those two checks together are the only id validation, and both are
+    strictly tighter than any length or shape bound.
+
+    The second check exists because the catalog can change under an open dialog: a
+    background manifest refresh replaces it, and without this check the
+    user's verdict on the clip in front of them would 400 and be discarded — after
+    which the clip comes back, which is the one thing a permanent verdict promises
+    it will not do.
     """
     state: DashboardState = request.app["state"]
 
@@ -687,13 +1174,13 @@ async def api_feature_videos_feedback(request: web.Request) -> web.Response:
         )
     if status not in VALID_STATUSES:
         return web.json_response({"error": "invalid status", "code": "invalid_status"}, status=400)
-    # Catalog membership is the ONLY id check, deliberately: it is strictly
-    # tighter than any length bound, so an oversized id is already refused here
-    # as "not a shipped slug". A separate length branch would ship a second
-    # permanent `code` for a case this one fully covers, and a `code` is API
-    # surface that cannot be narrowed later. This check is also what keeps the
-    # state file's key set closed to the shipped catalog.
-    if video_id not in {e.id for e in catalog()}:
+    # Membership is the ONLY id check, deliberately: it is strictly tighter than
+    # any length bound, so an oversized id is already refused here as "not a
+    # known clip". A separate length branch would ship a second permanent `code`
+    # for a case this one fully covers, and a `code` is API surface that cannot be
+    # narrowed later. This check is also what keeps the state file's key set
+    # closed to ids a publisher or the package actually shipped.
+    if video_id not in await asyncio.to_thread(known_video_ids) and not _was_issued(video_id):
         return web.json_response({"error": "unknown video id", "code": "unknown_video"}, status=400)
 
     # The write side needs the SAME gate the read side has, not just a symmetric
@@ -706,4 +1193,6 @@ async def api_feature_videos_feedback(request: web.Request) -> web.Response:
 
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, record_status, video_id, status)
+    # The persisted row supersedes the offer, so the id need not stay acceptable.
+    _forget_issued(video_id)
     return web.json_response({"ok": True})

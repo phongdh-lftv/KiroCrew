@@ -79,7 +79,15 @@ def _install_policy(monkeypatch, doc: dict | None) -> None:
 
 
 def _governance_rows(fake: MagicMock) -> list[dict]:
-    return [c[1] for c in fake.log_governance_decision.call_args_list]
+    """Only THIS scope's audit rows.
+
+    ``GET /api/dashboard/config`` resolves more than one governed answer (it also
+    reports ``feature_videos_download_enabled``), so every row on the endpoint is
+    not every row of this decision. Selecting by scope keeps these assertions
+    about social share instead of about how many governed fields the endpoint
+    happens to carry.
+    """
+    return [c[1] for c in fake.log_governance_decision.call_args_list if c[1]["scope"] == _SCOPE]
 
 
 # ── The catalog row ───────────────────────────────────────────────────────

@@ -4059,7 +4059,7 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
         # PUT body. Drop them here instead of listing them in _allowed -- they
         # stay unwritable, but a round-tripped read-only field must not 400 an
         # unrelated toggle save.
-        read_only_ignored_keys = {"gitlab_hosts", "jira_hosts", "social_share_enabled"}
+        read_only_ignored_keys = {"gitlab_hosts", "jira_hosts", "social_share_enabled", "feature_videos_download_enabled"}
         body = {
             k: v
             for k, v in body.items()
@@ -4377,9 +4377,14 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
     # share card has no server-side action to refuse, so this read IS the
     # enforcement point. Resolved off-thread (profile resolution may read from
     # disk); every decision is SEL-audited by the probe itself.
+    from kiro_crew import feature_videos_manifest
     from kiro_crew.dashboard import social_share
 
     social_share_denied = await asyncio.to_thread(social_share.is_share_denied)
+    # Same shape, same reason: the dashboard draws the hosted-video controls (and
+    # takes the remote-source path at all) only when the ceiling permits the fetch,
+    # and it has no other way to know. Off-thread and SEL-audited by the probe itself.
+    videos_download_denied = await asyncio.to_thread(feature_videos_manifest.download_denied)
     return web.json_response(
         {
             "restore_sessions": cfg.dashboard.restore_sessions,
@@ -4409,6 +4414,11 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
             # withdraws the "Share as image" menu entry; there is no toggle behind
             # it, so nothing here is writable.
             "social_share_enabled": not social_share_denied,
+            # Read-only: the `capabilities.feature_videos_download` answer. False
+            # means no manifest fetch, no clip download and no remote playback --
+            # only already-cached clips are offered -- so the dashboard renders the
+            # fetch control from this rather than discovering the ceiling with a 403.
+            "feature_videos_download_enabled": not videos_download_denied,
         }
     )
 

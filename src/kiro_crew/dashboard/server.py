@@ -881,7 +881,16 @@ _BASE_CSP = (
     # reachability check only, and to the same origins frame-src already allows.
     "connect-src 'self' ws://localhost:* ws://127.0.0.1:* "
     "https://esm.sh{connect_src_extra}; "
-    "media-src 'self' blob:; "
+    # {media_src_extra}: the ONE off-origin media source, and only while the
+    # ceiling permits it — the host of the signed feature-video manifest's own
+    # ``cdn_base``, admitted so an eligible clip that is not cached yet can stream
+    # from the CDN (``feature_videos._hosted_offers``). Empty in every other case:
+    # no manifest loaded, no host declared, or
+    # ``capabilities.feature_videos_download`` denied. This is defence in depth,
+    # not the control — the server simply never hands out a remote ``src`` when
+    # the ceiling denies, so a lagging header can only fail toward a blocked
+    # fetch, never toward an admitted one.
+    "media-src 'self' blob:{media_src_extra}; "
     "worker-src 'self' blob:; "
     # https://*.cloudfront.net: live preview iframes for deployed webapp
     # artifacts (WebAppArtifactCard / WebAppThumb). The artifact-deploy
@@ -954,6 +963,45 @@ _PNA_RESPONSE_HEADER = "Access-Control-Allow-Private-Network"
 # stable, unversioned assets; caching the approval avoids a preflight per
 # widget for the cap's duration.
 _VENDOR_PREFLIGHT_MAX_AGE_SECS = 7200
+
+
+#: Every character a hostname may carry in a CSP host-source, and the DNS length
+#: bound. The manifest's ``cdn_base`` is signed, so this is not the trust
+#: decision — it is the check that a host cannot terminate the directive it is
+#: written into.
+_HOSTNAME_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789.-")
+_MAX_HOSTNAME_CHARS = 253
+
+
+def _feature_video_media_src() -> str:
+    """The CDN host to add to ``media-src``, or ``""``.
+
+    Two reads, both in memory, because this runs on EVERY dashboard response: the
+    remembered governance answer (:func:`feature_videos_manifest.download_permitted_memo`)
+    and the manifest already loaded in the cache singleton. Neither touches disk
+    or network — a header builder that resolved a profile or read a manifest per
+    response would put that cost on every request the dashboard makes.
+
+    Returns nothing until a process has both evaluated the ceiling once and loaded
+    a manifest, which is the fail-closed direction: a missing entry blocks a
+    stream the server was not going to offer anyway.
+    """
+    try:
+        from kiro_crew import feature_videos_cache, feature_videos_manifest
+
+        if not feature_videos_manifest.download_permitted_memo():
+            return ""
+        manifest = feature_videos_cache.feature_video_cache().manifest
+        host = manifest.cdn_host if manifest is not None else ""
+    except Exception:  # pragma: no cover - a header must never fail to build
+        return ""
+    # Re-validated here rather than trusted: this value goes into a header, and a
+    # host carrying a space or a semicolon would end the directive early and
+    # rewrite the rest of the policy. A character-set check rather than a pattern
+    # match, so the allowed set is the thing being read.
+    if not host or len(host) > _MAX_HOSTNAME_CHARS or not set(host) <= _HOSTNAME_CHARS:
+        return ""
+    return f" https://{host}"
 
 
 async def _vendor_preflight_handler(request: web.Request) -> web.Response:
@@ -1155,6 +1203,7 @@ def _apply_security_headers(
             connect_src_extra=_LOOPBACK_FRAME_SRC,
             frame_src_extra=frame_src_extra,
             frame_ancestors=frame_ancestors,
+            media_src_extra=_feature_video_media_src(),
         ),
     )
     resp.headers.setdefault("Permissions-Policy", _PERMISSIONS_POLICY)

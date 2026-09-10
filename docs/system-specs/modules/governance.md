@@ -2271,7 +2271,9 @@ see `platform-context.md`), and
 chokepoints — **policy layer only**, see below), and
 `capabilities.social_share` (the dashboard's "Share as image" entry — read
 through `GET /api/dashboard/config`, every layer honoured, every decision
-audited; see below). Only the live `approval_mode`
+audited; see below), and `capabilities.feature_videos_download` (fetching the
+signed feature-video manifest and its media from the vendor CDN — four
+chokepoints, every layer honoured; see below). Only the live `approval_mode`
 clamp remains reserved.
 
 The `commands` scope now **doubles as the enterprise force-pin** for built-in
@@ -2641,6 +2643,55 @@ distinct `pinned` state — the card must separate "off because the operator lef
 switch off" (flippable) from "off because an administrator pinned it" (a config
 write returns 403), since offering a working-looking toggle for the second is the
 half-control this row exists to avoid.
+
+### Hosted feature-video media — `capabilities.feature_videos_download`
+
+Feature-intro clips are hosted, not bundled: the gateway fetches a signed manifest
+from a vendor CloudFront distribution and downloads the media it lists into
+`~/.kiro/crew/feature-videos/<release>/` (`feature_videos_manifest.py`,
+`feature_videos_cache.py`; user-facing doc `feature-videos.md`). That is outbound
+traffic to a vendor endpoint plus third-party bytes landing on disk — two things a
+managed fleet frequently may not do at all. Governed by the
+`capabilities.feature_videos_download` `SCOPE_CATALOG` capability row
+(`capability_default=True`, data-only shape — no `CONTRACT_VERSION` or evaluator
+change, mirroring the rows above).
+
+**Four chokepoints, because any one alone is a half-control.** The manifest fetch
+(no request is made, so nothing is learned), the clip download (no media lands on
+disk), the `src` handed to the browser, and `POST /api/feature-videos/fetch-all`
+(refused 403 rather than accepted into a task that would deny itself). The third is
+the one that matters: the other three are server-side, and only withholding the
+remote `src` stops the BROWSER from reaching the CDN. It is expressed by handing
+`feature_videos.validate_asset_path` an EMPTY host allowlist rather than by
+skipping a branch, so there is one code path and the host pin refuses the url
+either way.
+
+**Already-cached clips keep playing under a denial.** Withdrawing bytes that are
+already on disk is a separate decision this row does not make; a denied install
+offers its local entries and nothing else.
+
+**Shape: the social-share read, not the startup probes.** `vet_and_audit` on the
+pinned `dashboard:ui` surface key — never a caller-controlled header — and every
+denied decision is honoured whichever layer produced it, so a Level-2 profile bound
+to the dashboard can withdraw the fetch. `GET /api/dashboard/config` reports a
+read-only `feature_videos_download_enabled` so the frontend never guesses and never
+has to discover the ceiling through a 403; the field is dropped from the `PUT` body
+(both settings surfaces round-trip the whole `GET`), so it can never be written.
+
+**Fails CLOSED** (`fail_closed=True`), joining `capabilities.publish` /
+`theme_install` / `telemetry` / `tailnet_origin` / `social_share`: a wrong-DENY
+withholds an intro clip, a wrong-PERMIT makes a vendor-CDN request on a fleet that
+forbade vendor egress. An unevaluable ceiling is audited as the denial it produces.
+
+**The CSP entry is defence in depth, not the control.** `media-src` admits the
+manifest's own `cdn_base` host so an eligible-but-uncached clip can stream, and only
+while the ceiling permits it. The header builder runs synchronously on every
+dashboard response, so it reads a remembered answer
+(`feature_videos_manifest.download_permitted_memo`) rather than resolving a profile
+per response — starting denied, and refreshed by every real evaluation (the boot
+task, the config read, each selection). A lagging header can therefore only fail
+toward a blocked fetch, never toward an admitted one, and the server was not going
+to hand out a remote `src` in that state anyway.
 
 ### "Share as image" — `capabilities.social_share`
 

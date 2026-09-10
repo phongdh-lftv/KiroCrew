@@ -260,6 +260,9 @@ Set via `kirocrew config set agent.acp_backend kas`.
 | `dashboard.mcp_probe_timeout_secs` | Seconds to wait for an MCP server handshake during a probe (5-120) | `15` |
 | `dashboard.link_previews` | Fetch and render HTTP(S) link metadata in assistant messages. Off by default because each linked site receives a request from this machine | `false` |
 | `dashboard.feature_videos_enabled` | Play a short intro clip for a feature this install has not used yet. Instance-wide kill switch; see [Feature Videos](feature-videos.md). Off until real clips ship | `false` |
+| `dashboard.feature_videos_manifest_url` | Override the signed clip-manifest URL (mirrored or air-gapped installs). Must be `https`. Empty = the public CDN for this release. The signature is checked either way, so an override cannot introduce unsigned clips | `""` |
+| `dashboard.feature_videos_cache_max_mb` | Disk budget for downloaded clips. Whole release folders are removed oldest-first to fit; the release you are running is never removed. `0` = no cap | `500` |
+| `dashboard.feature_videos_keep_releases` | How many release folders of clips to keep, newest first. `0` = keep every release that fits the size budget | `0` |
 
 ### Slack
 

@@ -4,7 +4,8 @@ The Ollama HTTP client / OllamaManager lifecycle was replaced by an
 in-process llama.cpp runtime (``LlamaCppEmbedder``) plus a background
 HTTPS model download from the CDN (``ModelDownloadManager``). These tests
 never load a real model and never hit the network: the vendored Llama class
-is replaced with fakes and ``urllib.request.urlopen`` is monkeypatched.
+is replaced with fakes and ``urllib.request.urlopen`` is monkeypatched (on
+``asset_downloader``, which owns the transfer).
 """
 
 from __future__ import annotations
@@ -631,6 +632,16 @@ class TestLlamaCppEmbedder:
 # ═══════════════════════════════════════════════════════════════════════════
 
 
+def _as_opener(open_fn):
+    """Wrap a urlopen-shaped fake as a ``build_opener`` replacement.
+
+    ``asset_downloader`` routes every request through an opener carrying its
+    same-host redirect handler, so the opener is the seam a test replaces -- a fake
+    installed on ``urlopen`` would not be reached at all.
+    """
+    return lambda *args, **kwargs: SimpleNamespace(open=open_fn)
+
+
 def _fake_urlopen_factory(
     payload: bytes | None = None,
     fail_rcs: list[bool] | None = None,
@@ -685,7 +696,7 @@ class TestModelDownloadManager:
         def _no_network(*args, **kwargs):
             raise urllib.error.URLError("blocked by test fixture")
 
-        monkeypatch.setattr("kiro_crew.embeddings.urllib.request.urlopen", _no_network)
+        monkeypatch.setattr("kiro_crew.asset_downloader.build_opener", _as_opener(_no_network))
 
     def _mgr(self, tmp_path: Path) -> ModelDownloadManager:
         return ModelDownloadManager(target=tmp_path / "models" / "qwen3.gguf")
@@ -693,7 +704,7 @@ class TestModelDownloadManager:
     @pytest.mark.asyncio
     async def test_successful_download_installs_model(self, tmp_path: Path, monkeypatch) -> None:
         fake_urlopen, state = _fake_urlopen_factory()
-        monkeypatch.setattr("kiro_crew.embeddings.urllib.request.urlopen", fake_urlopen)
+        monkeypatch.setattr("kiro_crew.asset_downloader.build_opener", _as_opener(fake_urlopen))
         monkeypatch.setattr(
             "kiro_crew.embeddings._GGUF_SHA256", hashlib.sha256(_model_bytes()).hexdigest()
         )
@@ -711,7 +722,7 @@ class TestModelDownloadManager:
     async def test_env_url_override_wins(self, tmp_path: Path, monkeypatch) -> None:
         monkeypatch.setenv("KIROCREW_EMBED_MODEL_URL", "https://mirror.example/custom.gguf")
         fake_urlopen, state = _fake_urlopen_factory()
-        monkeypatch.setattr("kiro_crew.embeddings.urllib.request.urlopen", fake_urlopen)
+        monkeypatch.setattr("kiro_crew.asset_downloader.build_opener", _as_opener(fake_urlopen))
         monkeypatch.setattr(
             "kiro_crew.embeddings._GGUF_SHA256", hashlib.sha256(_model_bytes()).hexdigest()
         )
@@ -722,7 +733,7 @@ class TestModelDownloadManager:
     @pytest.mark.asyncio
     async def test_sha_mismatch_retries_then_fails(self, tmp_path: Path, monkeypatch) -> None:
         fake_urlopen, state = _fake_urlopen_factory()
-        monkeypatch.setattr("kiro_crew.embeddings.urllib.request.urlopen", fake_urlopen)
+        monkeypatch.setattr("kiro_crew.asset_downloader.build_opener", _as_opener(fake_urlopen))
         monkeypatch.setattr("kiro_crew.embeddings._GGUF_SHA256", "0" * 64)
         sleep_mock = AsyncMock()
         monkeypatch.setattr("kiro_crew.embeddings.asyncio.sleep", sleep_mock)
@@ -741,16 +752,15 @@ class TestModelDownloadManager:
     async def test_too_small_download_fails(self, tmp_path: Path, monkeypatch) -> None:
         """A payload under _GGUF_MIN_BYTES is rejected even with a matching sha.
 
-        Inherited upstream quirk: the too-small branch unlinks the staging
-        file before formatting its error message from ``staging.stat()``, so
-        the surfaced error is a generic "HTTPS download failed" rather than
-        "too small" (a known upstream quirk left as-is). The
-        safety property under test — an undersized file is never installed —
-        holds either way.
+        The surfaced error now names the real reason: ``asset_downloader`` reads
+        the staged size BEFORE unlinking it, where the previous inline copy read
+        it after and degraded every too-small download to a generic transport
+        error. The safety property under test — an undersized file is never
+        installed — held either way.
         """
         tiny = b"tiny placeholder"
         fake_urlopen, _state = _fake_urlopen_factory(payload=tiny)
-        monkeypatch.setattr("kiro_crew.embeddings.urllib.request.urlopen", fake_urlopen)
+        monkeypatch.setattr("kiro_crew.asset_downloader.build_opener", _as_opener(fake_urlopen))
         monkeypatch.setattr(
             "kiro_crew.embeddings._GGUF_SHA256", hashlib.sha256(tiny).hexdigest()
         )
@@ -759,14 +769,14 @@ class TestModelDownloadManager:
         assert not mgr.target.exists()
         assert list(mgr.target.parent.glob(".*.tmp")) == []
         assert mgr.status["step"] == "failed"
-        assert "download failed" in str(mgr.status["error"])
+        assert "too small" in str(mgr.status["error"])
 
     @pytest.mark.asyncio
     async def test_network_failure_reports_failed_status(
         self, tmp_path: Path, monkeypatch
     ) -> None:
         fake_urlopen, _state = _fake_urlopen_factory(fail_rcs=[True])
-        monkeypatch.setattr("kiro_crew.embeddings.urllib.request.urlopen", fake_urlopen)
+        monkeypatch.setattr("kiro_crew.asset_downloader.build_opener", _as_opener(fake_urlopen))
         mgr = self._mgr(tmp_path)
         assert await mgr.ensure_model(attempts=1) is False
         assert mgr.status["step"] == "failed"
@@ -779,7 +789,7 @@ class TestModelDownloadManager:
     ) -> None:
         """attempts=2: first request fails, second succeeds after backoff."""
         fake_urlopen, state = _fake_urlopen_factory(fail_rcs=[True, False])
-        monkeypatch.setattr("kiro_crew.embeddings.urllib.request.urlopen", fake_urlopen)
+        monkeypatch.setattr("kiro_crew.asset_downloader.build_opener", _as_opener(fake_urlopen))
         monkeypatch.setattr(
             "kiro_crew.embeddings._GGUF_SHA256", hashlib.sha256(_model_bytes()).hexdigest()
         )
@@ -800,7 +810,7 @@ class TestModelDownloadManager:
     ) -> None:
         monkeypatch.setenv("KIROCREW_SKIP_MODEL_DOWNLOAD", "1")
         fake_urlopen, state = _fake_urlopen_factory()
-        monkeypatch.setattr("kiro_crew.embeddings.urllib.request.urlopen", fake_urlopen)
+        monkeypatch.setattr("kiro_crew.asset_downloader.build_opener", _as_opener(fake_urlopen))
         mgr = self._mgr(tmp_path)
         assert await mgr.ensure_model(attempts=3) is False
         assert state.calls == 0  # no network activity whatsoever
@@ -811,7 +821,7 @@ class TestModelDownloadManager:
         self, tmp_path: Path, monkeypatch
     ) -> None:
         fake_urlopen, state = _fake_urlopen_factory()
-        monkeypatch.setattr("kiro_crew.embeddings.urllib.request.urlopen", fake_urlopen)
+        monkeypatch.setattr("kiro_crew.asset_downloader.build_opener", _as_opener(fake_urlopen))
         mgr = self._mgr(tmp_path)
         _write_model_file(mgr.target)
         assert await mgr.ensure_model(attempts=1) is True

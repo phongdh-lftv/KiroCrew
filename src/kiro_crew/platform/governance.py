@@ -1418,6 +1418,40 @@ SCOPE_CATALOG: Dict[str, ScopeSpec] = {
     # mobile_connect listing). Data row only — CONTRACT_VERSION and the
     # evaluator are untouched.
     "capabilities.social_share": ScopeSpec(CAPABILITY, capability_default=True),
+    # Hosted feature-video clips: the gateway fetches a signed manifest from a
+    # vendor CDN and then downloads media from it into the data home
+    # (``feature_videos_manifest`` / ``feature_videos_cache``). That is outbound
+    # traffic to a vendor endpoint plus third-party bytes landing on disk, which a
+    # managed fleet frequently may not do at all — so this row sits in the egress
+    # family with ``capabilities.telemetry`` and ``capabilities.publish`` rather
+    # than with the advisory probes, and is enforced FAIL-CLOSED: an unevaluable
+    # ceiling denies.
+    #
+    # Default True: naming the row without ``enabled`` keeps the documented
+    # behaviour for the standalone user, who additionally has the
+    # ``dashboard.feature_videos_enabled`` kill switch and a URL override. (An
+    # unnamed row is ungoverned and permitted regardless of this default — see the
+    # CAPABILITY-DEFAULT CONTRACT above.) An enterprise that wants no vendor fetch
+    # says so, and unlike the config switches this row is read from the trust-root
+    # ``security_policy.json``, which sits in ``security._SENSITIVE_HOME_DIRS`` —
+    # so the agent can neither read nor rewrite its own ceiling with its file tools.
+    # That list is the read+write fence; ``_WRITE_PROTECTED_HOME_PATHS`` is the
+    # readable-but-unwritable one, and the ceiling is deliberately not in it.
+    # ``kirocrew policy show`` is the brokered way to see it: a CLI subcommand that
+    # prints a posture summary, not an agent reading the file.
+    # Consulted at FOUR chokepoints, because any one alone is a half-control:
+    #   * the manifest fetch — no request is made, so nothing is learned;
+    #   * the clip download — no media lands on disk;
+    #   * the ``src`` handed to the browser — a denied install is never given a
+    #     remote url, so the BROWSER makes no CDN request either (this is the one
+    #     that matters; the other three are server-side);
+    #   * ``POST /api/feature-videos/fetch-all`` — refused 403 rather than
+    #     accepted into a task that would deny itself.
+    # Already-cached clips keep playing under a denial: withdrawing bytes already
+    # on disk is a separate decision this row does not make.
+    # Data row only — CONTRACT_VERSION and the evaluator are untouched (mirrors
+    # social_share).
+    "capabilities.feature_videos_download": ScopeSpec(CAPABILITY, capability_default=True),
 }
 
 
