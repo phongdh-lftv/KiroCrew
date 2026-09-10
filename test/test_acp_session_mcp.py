@@ -353,6 +353,34 @@ class TestMounting:
         # And without the checkout it is silently lost -- the defect, pinned.
         assert session_mcp.session_mcp_deny_rules("kirocrew") == []
 
+    def test_disabled_tools_is_the_structured_form_and_exempts_no_server(self, agents_dir):
+        """``(server, tool)`` pairs, the control plane included.
+
+        The deny-rule spelling is lossy (``mcp__a__b__c`` splits on the LAST
+        ``__``), so a consumer comparing against a two-field identity must take the
+        pairs. And this set answers "what did the user switch off", which is as true
+        of ``kirocrew-core`` as of any server -- HOW a backend honours it is the
+        caller's question (the restricted set exempts the control plane from
+        withholding; this does not exempt it from anything).
+        """
+        _write_spec(
+            agents_dir,
+            servers={
+                "kirocrew-core": {"command": "/x", "disabledTools": ["spawn_run"]},
+                "third": {"command": "/y", "disabledTools": ["a__b", 3, ""]},
+                "clean": {"command": "/z"},
+            },
+            tools=["@kirocrew-core", "@third", "@clean"],
+        )
+        pairs = session_mcp.session_mcp_disabled_tools("kirocrew")
+        assert pairs == frozenset({("kirocrew-core", "spawn_run"), ("third", "a__b")})
+        # The rule spelling is derived from the same pairs, so the two cannot drift.
+        assert session_mcp.session_mcp_deny_rules("kirocrew") == [
+            "mcp__kirocrew-core__spawn_run",
+            "mcp__third__a__b",
+        ]
+        assert session_mcp.session_mcp_disabled_tools(None) == frozenset()
+
     def test_a_stubbed_server_yields_to_its_broker_stub(self, agents_dir):
         """The caller appends the stub under the SAME name; two would collide.
 

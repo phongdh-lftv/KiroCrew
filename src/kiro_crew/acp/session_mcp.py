@@ -1,17 +1,21 @@
 """Kiro agent spec -> the ACP ``session/new`` ``mcpServers`` array.
 
 For a harness in :data:`~kiro_crew.acp_backends.ACP_BACKENDS_SESSION_MCP_ARRAY`,
-the ``session/new`` / ``session/load`` ``mcpServers`` parameter is where MCP
-servers come from and the only place: claude-agent-acp, its one member today,
-does not read ``~/.kiro/agents/<name>.json``. kiro-cli reaches the same servers
+the ``session/new`` / ``session/load`` ``mcpServers`` parameter is where Kiro
+Crew's MCP servers come from and the only place: neither claude-agent-acp nor
+codex-acp reads ``~/.kiro/agents/<name>.json``. kiro-cli reaches the same servers
 through ``--agent``, which is why that backend passes no array at all. Without
 the translation here such a session runs with ZERO Kiro Crew tools -- the harness
 itself works (prompts, streaming, permissions) but ``send_message``,
 ``spawn_run``, ``cron_add`` and every user-installed server are simply absent.
 
 Nothing here is Anthropic-specific by design: the module is keyed on the
-capability, not on the harness, so the next adapter that reads no agent spec
-joins the set rather than growing a second translator.
+capability, not on the harness, so the next adapter that reads no agent spec of
+Crew's joins the set rather than growing a second translator. What is genuinely
+per-adapter stays with that adapter's mirror -- codex narrows this output in
+:mod:`kiro_crew.providers.mirrors.codex` (it refuses ``sse`` outright, and its
+child processes inherit no environment), and the shape notes below are
+claude-agent-acp's own zod schema.
 
 The agent spec stays the single source of truth; there is no second,
 claude-shaped registry to keep in sync. It is read per spawn, so installing or
@@ -72,7 +76,7 @@ import json
 import logging
 from collections.abc import Collection
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from kiro_crew.agent import (
     _mcp_registry_mode,
@@ -92,7 +96,13 @@ logger = logging.getLogger(__name__)
 # install is broken. Re-derived, not read from the spec, is also what keeps them
 # out of the registry filter below: they are the host's own process, not a
 # third-party server the admin's catalog governs.
-_CONTROL_PLANE_SERVERS = ("kirocrew-core", "kirocrew-cron")
+#
+# PUBLIC because the codex projection carries this session's identity onto these
+# two entries and onto NOTHING else. Naming the same tuple twice is how the two
+# decisions drift apart, and the safety of that carriage rests on this being the
+# set the loop below REPLACES from the managed source: the element's command, args
+# and env are Crew's own by construction, not the spec's.
+CONTROL_PLANE_SERVERS = ("kirocrew-core", "kirocrew-cron")
 
 # kiro-cli's enterprise-governance discriminator, mirrored rather than imported
 # (``agent._MCP_REGISTRY_TYPE`` is private; a ratchet test pins the two equal).
@@ -301,13 +311,48 @@ def session_mcp_deny_rules(agent: str | None, *, work_dir: str | Path | None = N
     connecting to the server. Those extra tools still reach the host permission
     gate; they are a wider surface, not an ungated one.
     """
-    spec = _agent_spec_for(agent, work_dir) if agent else None
+    return sorted(
+        f"mcp__{server}__{tool}"
+        for server, tool in session_mcp_disabled_tools(agent, work_dir=work_dir)
+    )
+
+
+def session_mcp_disabled_tools(
+    agent: str | None,
+    *,
+    work_dir: str | Path | None = None,
+    spec: dict[str, Any] | None = None,
+) -> frozenset[tuple[str, str]]:
+    """Every ``(server, tool)`` pair the spec's ``disabledTools`` switches off.
+
+    The structured form of :func:`session_mcp_deny_rules`, which spells the same
+    pairs as claude ``permissions.deny`` rules. Kept as PAIRS here because the
+    ``mcp__server__tool`` spelling is lossy -- it splits on the last ``__``, so a
+    tool name containing ``__`` reads back as part of the server -- and a consumer
+    that compares against an identity the adapter reports as two separate fields
+    (codex's ``rawInput.server`` / ``rawInput.tool``) must not go through it.
+
+    No server is exempt, the control plane included. This set answers "what did
+    the user switch off", and that is true of ``kirocrew-core`` exactly as it is
+    of a third-party server: the dashboard writes the key on an ordinary tool-off
+    action for any of them. What differs per server is how -- or whether -- a
+    given backend can HONOUR it, and that is the caller's question, not this one's
+    (see :func:`session_mcp_restricted_servers` for the one place the control
+    plane is treated differently, and why).
+
+    ``spec`` lets a caller hand in a spec it has already parsed; see
+    :func:`session_mcp_projection` for why a second parse is a consistency window.
+    Never raises: an unreadable spec switches nothing off, and it also declares
+    nothing that could be mounted.
+    """
     if spec is None:
-        return []
+        spec = _agent_spec_for(agent, work_dir) if agent else None
+    if spec is None:
+        return frozenset()
     raw = spec.get("mcpServers")
     if not isinstance(raw, dict):
-        return []
-    rules: set[str] = set()
+        return frozenset()
+    pairs: set[tuple[str, str]] = set()
     for name, entry in raw.items():
         if not isinstance(entry, dict):
             continue
@@ -316,8 +361,82 @@ def session_mcp_deny_rules(agent: str | None, *, work_dir: str | Path | None = N
             continue
         for tool in disabled:
             if isinstance(tool, str) and tool:
-                rules.add(f"mcp__{name}__{tool}")
-    return sorted(rules)
+                pairs.add((str(name), tool))
+    return frozenset(pairs)
+
+
+def session_mcp_restricted_servers(
+    agent: str | None,
+    *,
+    work_dir: str | Path | None = None,
+    spec: dict[str, Any] | None = None,
+) -> frozenset[str]:
+    """Spec servers whose per-TOOL narrowing no transport can carry as an element.
+
+    The sibling of :func:`session_mcp_deny_rules`, for a backend that has no file
+    to put deny rules in. Same input, same reason to exist: ``disabledTools`` is a
+    RESTRICTION, and a backend that forwards the server while dropping it widens
+    the session's tool surface behind the user's back -- the dashboard writes that
+    key on an ordinary tool-off action, and this repo already treats losing it as a
+    defect ("dropping ``disabledTools`` on a save would silently widen the agent's
+    tool surface").
+
+    Claude re-applies the restriction as ``permissions.deny`` rules and so may keep
+    the server. A backend with no deny channel has only one faithful option, which
+    is to not mount the server at all -- so this returns the NAMES and lets that
+    backend omit them. Withholding a server is an availability cost; forwarding an
+    un-narrowed one is a capability the user switched off.
+
+    **Crew's own control plane is exempt from WITHHOLDING, not from the
+    restriction.** ``kirocrew-core`` / ``kirocrew-cron`` are re-derived from
+    ``managed_mcp_spec_entry``, which emits only command/args/env, so a
+    ``disabledTools`` on their spec entry never reaches the element -- and
+    withholding the whole server on the strength of it would leave the session
+    unable to report back to its channel at all, which is the exact defect this
+    module exists to fix. The restriction itself is still honoured, on the one
+    channel this transport does have: every call to one of these servers reaches
+    Crew as a ``session/request_permission`` (their tools carry no annotations, so
+    codex prompts for each), and the client answers a call to a switched-off tool
+    with the adapter's reject option before anything runs. The pairs it checks
+    come from :func:`session_mcp_disabled_tools`, on the same parse as this set.
+    That channel is complete for the control plane and NOT for a third-party
+    server -- a tool annotated ``readOnlyHint`` is auto-approved inside codex and
+    never prompts -- which is why the two are treated differently here rather
+    than both being mounted.
+
+    ``disabled`` is deliberately NOT part of this. A disabled server is already
+    absent from the array by a different mechanism: ``agent.build_agent_config``
+    strips its ``@alias`` from ``tools``, and the allowlist filter in
+    :func:`session_mcp_servers` mounts nothing ``tools`` does not name. Re-checking
+    it here would be a second spelling of a rule that already holds.
+
+    ``spec`` lets a caller pass a spec it has ALREADY parsed. Two readers deriving
+    from two parses of a user-writable file is a consistency window: a spec that
+    gains ``disabledTools`` between them yields a restriction set from the old bytes
+    applied to a translation of the new ones, and the restricted server mounts
+    unrestricted. :func:`session_mcp_projection` is the seam that closes it; this
+    parameter is what lets it.
+
+    Blocking when it parses (so callers run it off the event loop), free when the
+    spec is handed in. Never raises: an unreadable spec yields no restrictions, and
+    the servers it would have named are the ones the same unreadable spec also fails
+    to declare.
+    """
+    if spec is None:
+        spec = _agent_spec_for(agent, work_dir) if agent else None
+    if spec is None:
+        return frozenset()
+    raw = spec.get("mcpServers")
+    if not isinstance(raw, dict):
+        return frozenset()
+    return frozenset(
+        str(name)
+        for name, entry in raw.items()
+        if str(name) not in CONTROL_PLANE_SERVERS
+        and isinstance(entry, dict)
+        and isinstance(entry.get("disabledTools"), list)
+        and any(isinstance(t, str) and t for t in entry["disabledTools"])
+    )
 
 
 def _registry_mode() -> bool:
@@ -346,11 +465,57 @@ def _registry_mode() -> bool:
         return True
 
 
+class SessionMcpProjection(NamedTuple):
+    """Everything a backend derives from the agent spec, from ONE parse of it."""
+
+    #: The translated ``mcpServers`` array (:func:`session_mcp_servers`).
+    servers: list[dict[str, Any]]
+    #: Servers whose per-tool narrowing forces withholding them
+    #: (:func:`session_mcp_restricted_servers`).
+    restricted: frozenset[str]
+    #: Every ``(server, tool)`` the spec switches off, no server exempt
+    #: (:func:`session_mcp_disabled_tools`).
+    disabled_tools: frozenset[tuple[str, str]]
+
+
+def session_mcp_projection(
+    agent: str | None,
+    *,
+    stub_server_names: Collection[str] = (),
+    work_dir: str | Path | None = None,
+) -> SessionMcpProjection:
+    """The array, the withhold set AND the per-tool restrictions, from ONE parse.
+
+    A backend that translates the spec, withholds part of it on the strength of the
+    spec, and refuses individual calls on the strength of the spec must derive all
+    three from the same bytes. Independent parses of a user-writable file are a
+    consistency window: an entry that gains ``disabledTools`` between two of them
+    produces a restriction set that does not mention it and a translation that
+    carries it, so the narrowed server mounts un-narrowed -- or a deny set that
+    names a tool on a server the array, read a moment earlier, never mounted.
+
+    Returning them from one call makes that structural rather than a convention. The
+    alternative -- documenting that callers should thread a ``spec=`` through three
+    functions -- is a rule a future caller can forget, and forgetting it is silent.
+
+    Blocking (parses the spec once), so callers run it off the event loop.
+    """
+    spec = _agent_spec_for(agent, work_dir) if agent else None
+    return SessionMcpProjection(
+        servers=session_mcp_servers(
+            agent, stub_server_names=stub_server_names, work_dir=work_dir, spec=spec
+        ),
+        restricted=session_mcp_restricted_servers(agent, work_dir=work_dir, spec=spec),
+        disabled_tools=session_mcp_disabled_tools(agent, work_dir=work_dir, spec=spec),
+    )
+
+
 def session_mcp_servers(
     agent: str | None,
     *,
     stub_server_names: Collection[str] = (),
     work_dir: str | Path | None = None,
+    spec: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """The ACP ``mcpServers`` array for a session running as *agent*.
 
@@ -367,13 +532,18 @@ def session_mcp_servers(
     projection resolves the same set for the same reason; the caller owns the
     overlay, so it resolves the set and passes it down.
 
-    Blocking (reads the agent spec), so callers run it off the event loop.
-    Deterministically ordered by server name, which keeps the array comparable
-    across a session/new and the session/load that resumes it.
+    ``spec`` lets a caller hand in a spec it has already parsed; see
+    :func:`session_mcp_projection` for why a second parse is a consistency window
+    rather than a cost.
+
+    Blocking when it parses (so callers run it off the event loop). Deterministically
+    ordered by server name, which keeps the array comparable across a session/new and
+    the session/load that resumes it.
     """
     servers: dict[str, Any] = {}
     tools: Any = None
-    spec = _agent_spec_for(agent, work_dir) if agent else None
+    if spec is None:
+        spec = _agent_spec_for(agent, work_dir) if agent else None
     if spec is not None:
         raw = spec.get("mcpServers")
         if isinstance(raw, dict):
@@ -431,7 +601,7 @@ def session_mcp_servers(
             )
             servers.pop(name)
 
-    for name in _CONTROL_PLANE_SERVERS:
+    for name in CONTROL_PLANE_SERVERS:
         managed = managed_mcp_spec_entry(name)
         if managed is not None:
             servers[name] = managed
