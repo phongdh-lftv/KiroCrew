@@ -36,6 +36,17 @@ interface DashboardState {
   channelTrusted: boolean
   refreshTrigger: number
   unreadSlots: string[]
+  /** Watermarks for relayed clears: slot -> newest message ts that marked it
+   *  unread. A cross-window `slot_read` clears the badge only when its read
+   *  watermark chronologically covers this value, so an in-flight relay
+   *  cannot erase a badge a NEWER message lit. A manual mark-as-unread
+   *  records the MANUAL_UNREAD sentinel, which no watermark covers — the
+   *  deliberate note to self answers only to this window — and the sentinels
+   *  are persisted so a reload cannot demote the reminder to clearable.
+   *  Message watermarks are deliberately NOT persisted: a stale one could
+   *  block legitimate clears forever, and after boot no relay is in flight
+   *  for them. */
+  unreadSince: Record<string, string>
   slotsLoaded: boolean
   updateProgress: { step: string; detail: string } | null
   // Desktop updater: an update is discoverable/staged (found|downloading|
@@ -53,6 +64,81 @@ interface DashboardState {
 }
 
 const safeGet = (key: string, fallback: string) => { try { return localStorage.getItem(key) ?? fallback } catch { return fallback } }
+/** unreadSince sentinel for a manual mark-as-unread. It parses as an invalid
+ *  instant, so the conservative comparison below can never treat any relayed
+ *  read watermark as covering it. A bare non-letter char, never rendered —
+ *  the constant name carries the meaning. */
+export const MANUAL_UNREAD = '\uffff'
+
+/** True when `read` chronologically covers `since`. Timestamps are parsed as
+ *  instants — mixed-offset server strings make lexical order lie about time
+ *  order — and ANY unparseable side answers false, so an invalid watermark
+ *  can never clear a badge (and the manual sentinel never parses). */
+const readCovers = (read: string | undefined, since: string): boolean => {
+  if (read === undefined) return false
+  const r = Date.parse(read)
+  const s = Date.parse(since)
+  return Number.isFinite(r) && Number.isFinite(s) && r >= s
+}
+
+/** Chronologically newer of two parseable instants; a side that does not
+ *  parse loses to one that does, and `undefined` loses to anything. */
+const newerInstant = (a: string | undefined, b: string | undefined): string | undefined => {
+  if (a === undefined) return b
+  if (b === undefined) return a
+  const pa = Date.parse(a)
+  const pb = Date.parse(b)
+  if (!Number.isFinite(pa)) return Number.isFinite(pb) ? b : a
+  if (!Number.isFinite(pb)) return a
+  return pb > pa ? b : a
+}
+
+/** The manual-unread sentinels survive reload: a deliberate reminder must not
+ *  become clearable-by-relay just because the window restarted. They persist
+ *  to per-tab sessionStorage, matching their state scope — each window's Redux
+ *  holds only the sentinels set in that window, so a shared localStorage key
+ *  would let window A's write clobber the set window B just persisted and
+ *  silently demote B's reminder. sessionStorage restores this window's own
+ *  reminders and is untouchable by siblings. Message watermarks stay
+ *  ephemeral — a stale one could block legitimate clears forever, and after
+ *  boot no relay is in flight for them. */
+const persistManualUnread = (unreadSince: Record<string, string>): void => {
+  const manual = Object.keys(unreadSince).filter(k => unreadSince[k] === MANUAL_UNREAD)
+  try { sessionStorage.setItem('mc-unread-manual', JSON.stringify(manual)) } catch { /* SecurityError / quota */ }
+}
+/** Persist an unread change as a DELTA against the shared store, never as this
+ *  window's whole set. In-memory `unreadSlots` is one window's view; the
+ *  localStorage key is shared by every window, so writing the whole in-memory
+ *  set publishes this window's divergence (a reconnect gap, a relay not yet
+ *  delivered) over keys a sibling window just persisted — silently un-badging
+ *  a slot for every window that boots after it. Composing per-slot deltas
+ *  converges instead: each write touches only the keys its action names, and
+ *  keys this window has never heard of pass through untouched. */
+const persistUnreadDelta = (add: readonly string[], remove: readonly string[]): void => {
+  let stored: string[]
+  try { stored = JSON.parse(localStorage.getItem('mc-unread-slots') ?? '[]') as string[] } catch { stored = [] }
+  const next = stored.filter(k => !remove.includes(k))
+  for (const k of add) if (!next.includes(k)) next.push(k)
+  safeSet('mc-unread-slots', JSON.stringify(next))
+}
+/** Boot restore for manual-unread sentinels (exported for tests). Reconciles
+ *  this window's persisted sentinels against the shared unread list: a
+ *  sentinel whose badge a sibling window cleared while this tab was unloaded
+ *  is an orphan — invisible in the UI, yet it would shield its slot from
+ *  every future remote clear. Orphans are dropped and the pruned list is
+ *  written back, so sentinel lifetime never exceeds badge lifetime. */
+export const restoreManualUnread = (): Record<string, string> => {
+  try {
+    const manual = JSON.parse(sessionStorage.getItem('mc-unread-manual') ?? '[]') as string[]
+    let badges: string[]
+    try { badges = JSON.parse(localStorage.getItem('mc-unread-slots') ?? '[]') as string[] } catch { badges = [] }
+    const live = manual.filter(k => badges.includes(k))
+    if (live.length !== manual.length) {
+      try { sessionStorage.setItem('mc-unread-manual', JSON.stringify(live)) } catch { /* best-effort */ }
+    }
+    return Object.fromEntries(live.map(k => [k, MANUAL_UNREAD]))
+  } catch { return {} }
+}
 // When running embedded inside the Instances hub (an iframe), relay unread-count
 // changes to the parent so it can badge this instance's switcher chip (§5.3).
 // Only the count (a non-secret number) is sent; the parent validates event.origin
@@ -83,6 +169,7 @@ const initialState: DashboardState = {
   channelTrusted: false,
   refreshTrigger: 0,
   unreadSlots: (() => { try { return JSON.parse(localStorage.getItem('mc-unread-slots') ?? '[]') as string[] } catch { return [] } })(),
+  unreadSince: restoreManualUnread(),
   slotsLoaded: false,
   updateProgress: null,
   desktopUpdateAvailable: false,
@@ -153,8 +240,17 @@ const reconcileSlots = (state: DashboardState, liveKeys: Set<string>, evictStale
   const unread = state.unreadSlots ?? []
   const drained = unread.filter(k => liveKeys.has(k))
   if (drained.length !== unread.length) {
+    // unreadSince tolerates partial preloaded test state, like `?? []` above.
+    if (state.unreadSince) {
+      let droppedManual = false
+      for (const k of unread) if (!liveKeys.has(k)) {
+        if (state.unreadSince[k] === MANUAL_UNREAD) droppedManual = true
+        delete state.unreadSince[k]
+      }
+      if (droppedManual) persistManualUnread(state.unreadSince)
+    }
     state.unreadSlots = drained
-    safeSet('mc-unread-slots', JSON.stringify(drained))
+    persistUnreadDelta([], unread.filter(k => !liveKeys.has(k)))
   }
   // Eviction is NOT recoverable, so it is skipped when the caller cannot vouch
   // for the list's freshness: an HTTP reply in flight can be older than the live
@@ -349,7 +445,12 @@ const dashboardSlice = createSlice({
     removeSlotOptimistic(state, action: PayloadAction<string>) {
       state.slots = state.slots.filter(s => s.key !== action.payload)
       state.unreadSlots = state.unreadSlots.filter(k => k !== action.payload)
-      safeSet('mc-unread-slots', JSON.stringify(state.unreadSlots))
+      if (state.unreadSince?.[action.payload] !== undefined) {
+        const wasManual = state.unreadSince[action.payload] === MANUAL_UNREAD
+        delete state.unreadSince[action.payload]
+        if (wasManual) persistManualUnread(state.unreadSince)
+      }
+      persistUnreadDelta([], [action.payload])
     },
     updateSlot(state, action: PayloadAction<Partial<ChatSlot> & { key: string }>) {
       const slot = state.slots.find(s => s.key === action.payload.key)
@@ -431,13 +532,61 @@ const dashboardSlice = createSlice({
       }
     },
     triggerRefresh(state) { state.refreshTrigger += 1 },
-    markSlotUnread(state, action: PayloadAction<string>) {
-      if (!state.unreadSlots.includes(action.payload)) state.unreadSlots.push(action.payload)
-      safeSet('mc-unread-slots', JSON.stringify(state.unreadSlots))
+    markSlotUnread(state, action: PayloadAction<string | { slot: string; ts?: string }>) {
+      const slot = typeof action.payload === 'string' ? action.payload : action.payload.slot
+      const ts = typeof action.payload === 'string' ? undefined : action.payload.ts
+      if (!state.unreadSlots.includes(slot)) state.unreadSlots.push(slot)
+      if (!state.unreadSince) state.unreadSince = {}  // partial preloaded state
+      // Watermarks carry only ACTUAL server-minted message timestamps: a
+      // frame without one falls back to the slot's last_ts, and when neither
+      // exists nothing is recorded (any relayed read may clear). Minting
+      // client time here would make windows disagree about the same message
+      // and strand badges against valid relays.
+      const effectiveTs = typeof action.payload === 'string'
+        ? undefined
+        : (ts ?? state.slots.find(s => s.key === slot)?.last_ts)
+      if (typeof action.payload !== 'string') {
+        const prev = state.unreadSince[slot]
+        // A manual sentinel is never demoted by a message arrival; otherwise
+        // the chronologically newest parseable instant wins.
+        if (effectiveTs !== undefined && prev !== MANUAL_UNREAD) {
+          const next = newerInstant(prev, effectiveTs)
+          if (next !== undefined && next !== prev) state.unreadSince[slot] = next
+        }
+      } else {
+        // Manual mark-as-unread: the sentinel means NO remote clear can meet
+        // the bar — the deliberate reminder answers only to this window.
+        state.unreadSince[slot] = MANUAL_UNREAD
+        persistManualUnread(state.unreadSince)
+      }
+      persistUnreadDelta([slot], [])
     },
     markSlotRead(state, action: PayloadAction<string>) {
+      if (state.unreadSince?.[action.payload] !== undefined) {
+        const wasManual = state.unreadSince[action.payload] === MANUAL_UNREAD
+        delete state.unreadSince[action.payload]
+        if (wasManual) persistManualUnread(state.unreadSince)
+      }
+      // No-op guard: relayed slot_read frames fan in from every window (own
+      // echo included); skipping absent keys keeps echo fan-in from
+      // multiplying localStorage writes.
+      if (!state.unreadSlots.includes(action.payload)) return
       state.unreadSlots = state.unreadSlots.filter(k => k !== action.payload)
-      safeSet('mc-unread-slots', JSON.stringify(state.unreadSlots))
+      persistUnreadDelta([], [action.payload])
+    },
+    /** A read relayed from ANOTHER window: honors the watermark. Clears only
+     *  when the relay's `readTs` covers everything that lit the badge here —
+     *  a missing local watermark (boot-restored badge) accepts any relay,
+     *  the MANUAL_UNREAD sentinel accepts none, and a newer local ts keeps
+     *  the badge for the message the reader had not seen. */
+    remoteSlotRead(state, action: PayloadAction<{ slot: string; readTs?: string }>) {
+      const { slot, readTs } = action.payload
+      const since = state.unreadSince?.[slot]
+      if (since !== undefined && !readCovers(readTs, since)) return
+      if (state.unreadSince) delete state.unreadSince[slot]
+      if (!state.unreadSlots.includes(slot)) return
+      state.unreadSlots = state.unreadSlots.filter(k => k !== slot)
+      persistUnreadDelta([], [slot])
     },
     setUpdateProgress(state, action: PayloadAction<{ step: string; detail: string } | null>) {
       state.updateProgress = action.payload
@@ -544,7 +693,7 @@ const dashboardSlice = createSlice({
   },
 })
 
-export const { sseStatus, sseYolo, setYoloDuration, sseConnected, sseDisconnected, sseSlots, setSidebarOrder, sseTodoUpdate, sseMcpReportUpdate, touchSlotActivity, setChannelTrusted, sseSlotTitle, addSlotOptimistic, removeSlotOptimistic, updateSlot, updateSlotFolder, updateSlotPin, triggerRefresh, markSlotUnread, markSlotRead, setUpdateProgress,
+export const { sseStatus, sseYolo, setYoloDuration, sseConnected, sseDisconnected, sseSlots, setSidebarOrder, sseTodoUpdate, sseMcpReportUpdate, touchSlotActivity, setChannelTrusted, sseSlotTitle, addSlotOptimistic, removeSlotOptimistic, updateSlot, updateSlotFolder, updateSlotPin, triggerRefresh, markSlotUnread, markSlotRead, remoteSlotRead, setUpdateProgress,
   setDesktopUpdateAvailable, sseSubagentStatus, sseSubagentText, sseSlotColor, setSessionDefaultColor, setSessionColorsMode, setSessionColorsPalette, setSessionColorsIntensity, setEnabledAppIds, patchSlotSourceLinks, patchSlotLink } = dashboardSlice.actions
 
 /**
