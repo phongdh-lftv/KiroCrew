@@ -103,6 +103,11 @@ async function openFilters() {
 beforeEach(() => {
   vi.clearAllMocks()
   localStorage.clear()
+  // These cases read the search row and the count line, which the roster only
+  // shows unfolded. happy-dom's default innerWidth (1024) sits exactly on the
+  // fold boundary (rosterIsRail: rail below lg), so pin a wide window rather
+  // than lean on the default.
+  Object.defineProperty(window, 'innerWidth', { value: 1440, configurable: true, writable: true })
 })
 
 describe('matchesSource', () => {

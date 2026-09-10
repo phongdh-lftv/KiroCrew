@@ -14772,6 +14772,8 @@
       "opening_thread": "Abrindo a conversa…",
       "pick_a_member": "Escolha um membro para abrir a conversa.",
       "resize_roster": "Redimensionar a lista de membros",
+      "collapse_roster": "Recolher a lista de membros",
+      "expand_roster": "Expandir a lista de membros",
       "sort_filter_members": "Ordenar e filtrar membros",
       "filter_origin": "Origem",
       "filter_status_working_description": "Membros cuja conversa está no meio de um turno agora",

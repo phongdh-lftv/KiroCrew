@@ -105,7 +105,7 @@ vi.mock('react-router-dom', async (importOriginal) => {
 })
 
 import { api } from '../../api/client'
-import MembersPage, { CREW_SUMMARY_TAB_ID, MEMBERS_UNCONFIRMED_WITHHELD_VIEWS, MEMBERS_UNFED_VIEWS, MEMBERS_WITHHELD_VIEWS, panelSitsBeside, resolveDefaultMember } from './MembersPage'
+import MembersPage, { CREW_SUMMARY_TAB_ID, MEMBERS_UNCONFIRMED_WITHHELD_VIEWS, MEMBERS_UNFED_VIEWS, MEMBERS_WITHHELD_VIEWS, ROSTER_RAIL_BREAKPOINT, ROSTER_RAIL_W, THREAD_DOCKED_MIN_W, panelSitsBeside, resolveDefaultMember, rosterIsRail } from './MembersPage'
 import { __resetPanelTabs, VIEW_DATA_SOURCE } from '../../hooks/usePanelTabs'
 
 /** The page's own memory key (mirrors the constant in MembersPage.tsx). */
@@ -978,13 +978,123 @@ describe('MembersPage side panel (Crew summary tab) and edit jump', () => {
     await waitFor(() => expect(screen.queryByTestId('member-crew-summary')).toBeNull())
   })
 
-  it('panelSitsBeside: the docking boundary is the shell reserve + roster + gaps + panel minimum', () => {
-    // 560 (rail + chat minimum) + 320 (panel min) + 264 (roster) + 24 (gaps) = 1168.
-    expect(panelSitsBeside({ winW: 1168, rosterW: 264, isMobile: false })).toBe(true)
-    expect(panelSitsBeside({ winW: 1167, rosterW: 264, isMobile: false })).toBe(false)
-    // A wider roster needs a wider window; mobile never docks.
-    expect(panelSitsBeside({ winW: 1168, rosterW: 300, isMobile: false })).toBe(false)
+  it('panelSitsBeside: the docking boundary is the shell reserve + docked thread floor + roster + gaps + panel minimum', () => {
+    // 560 (rail + chat minimum) + 100 (thread floor 420 over the 320 minimum)
+    // + 320 (panel min) + 264 (roster) + 24 (gaps) = 1268. The floor is what
+    // stopped a 1280 window docking a 432px panel beside a 332px thread (#9979).
+    expect(THREAD_DOCKED_MIN_W).toBe(420)
+    expect(panelSitsBeside({ winW: 1268, rosterW: 264, isMobile: false })).toBe(true)
+    expect(panelSitsBeside({ winW: 1267, rosterW: 264, isMobile: false })).toBe(false)
+    // A wider roster needs a wider window; the folded rail needs less (1060); mobile never docks.
+    expect(panelSitsBeside({ winW: 1268, rosterW: 300, isMobile: false })).toBe(false)
+    expect(panelSitsBeside({ winW: 1060, rosterW: ROSTER_RAIL_W, isMobile: false })).toBe(true)
+    expect(panelSitsBeside({ winW: 1059, rosterW: ROSTER_RAIL_W, isMobile: false })).toBe(false)
     expect(panelSitsBeside({ winW: 2000, rosterW: 264, isMobile: true })).toBe(false)
+  })
+
+  it('rosterIsRail: folds below lg unless the user said otherwise; never on mobile', () => {
+    expect(ROSTER_RAIL_BREAKPOINT).toBe(1024)
+    expect(rosterIsRail({ winW: 1023, isMobile: false, pref: null })).toBe(true)
+    expect(rosterIsRail({ winW: 1024, isMobile: false, pref: null })).toBe(false)
+    // A stored preference wins at every width.
+    expect(rosterIsRail({ winW: 1440, isMobile: false, pref: true })).toBe(true)
+    expect(rosterIsRail({ winW: 800, isMobile: false, pref: false })).toBe(false)
+    // Below md the page is single-pane: the roster is the page, nothing folds.
+    expect(rosterIsRail({ winW: 600, isMobile: true, pref: true })).toBe(false)
+  })
+
+  it('below lg the roster opens as the avatar rail: faces only, the thread keeps its room, the toggle unfolds it and persists', async () => {
+    setWindowWidth(NARROW_WINDOW)
+    await renderPage([row({ bound: true, slot_key: 'member-oncall', last_message: 'hello' }), row({ name: 'beta', slug: 'beta' })])
+    const roster = await screen.findByTestId('member-roster')
+    expect(roster).toHaveAttribute('data-rail', 'true')
+    expect(roster.style.getPropertyValue('--roster-w')).toBe(`${ROSTER_RAIL_W}px`)
+    // Prose and fields are gone; the rows stay, the name kept for AT only.
+    expect(screen.queryByTestId('member-count')).toBeNull()
+    expect(screen.queryByTestId('member-search')).toBeNull()
+    expect(screen.queryByTestId('member-roster-resize')).toBeNull()
+    expect(screen.queryByTestId('member-star-oncall')).toBeNull()
+    const rowBtn = (await rosterRow('oncall')).closest('button')!
+    expect(rowBtn).toHaveAttribute('title', expect.stringContaining('oncall'))
+    // A face is still the way in.
+    fireEvent.click(rowBtn)
+    expect(await screen.findByTestId('chat-pane-stub')).toHaveTextContent('member-oncall')
+    // Unfold: the list comes back for this session. Below lg the unfold is
+    // NOT persisted — search and filters only exist unfolded, so unfolding is
+    // a step on the way to a member, and a stored '0' would bring the 252px
+    // thread back on every later visit.
+    const toggle = screen.getByTestId('member-roster-toggle')
+    expect(toggle).toHaveAttribute('aria-pressed', 'true')
+    fireEvent.click(toggle)
+    await waitFor(() => expect(screen.getByTestId('member-roster')).not.toHaveAttribute('data-rail'))
+    expect(screen.getByTestId('member-count')).toBeInTheDocument()
+    expect(screen.getByTestId('member-search')).toBeInTheDocument()
+    expect(localStorage.getItem('mc-members-roster-collapsed')).toBeNull()
+    expect(screen.getByTestId('member-roster').style.getPropertyValue('--roster-w')).toBe('264px')
+  })
+
+  it('at lg and above the roster opens unfolded; folding it there persists, unfolding CLEARS the preference', async () => {
+    await renderPage([row()])
+    const roster = await screen.findByTestId('member-roster')
+    expect(roster).not.toHaveAttribute('data-rail')
+    fireEvent.click(screen.getByTestId('member-roster-toggle'))
+    await waitFor(() => expect(screen.getByTestId('member-roster')).toHaveAttribute('data-rail', 'true'))
+    expect(localStorage.getItem('mc-members-roster-collapsed')).toBe('1')
+    // Unfolding at lg+ is a return to the default, not a second preference:
+    // the key is removed, so it cannot win below lg on a later visit (a stored
+    // unfold there would be the 252px thread again).
+    fireEvent.click(screen.getByTestId('member-roster-toggle'))
+    await waitFor(() => expect(screen.getByTestId('member-roster')).not.toHaveAttribute('data-rail'))
+    expect(localStorage.getItem('mc-members-roster-collapsed')).toBeNull()
+  })
+
+  it('a stored fold made at lg+ wins below lg too; a legacy stored "0" reads as no preference', async () => {
+    localStorage.setItem('mc-members-roster-collapsed', '0')
+    setWindowWidth(NARROW_WINDOW)
+    await renderPage([row()])
+    expect(await screen.findByTestId('member-roster')).toHaveAttribute('data-rail', 'true')
+  })
+
+  it('the rail shows the whole roster: a persisted filter that hides everyone cannot blank the strip', async () => {
+    // Starred-only persisted, no member starred: unfolded this is the
+    // "filters hide all" notice with its clear button; the rail has neither
+    // control, so it shows everyone and the unfolded list narrows again.
+    localStorage.setItem('mc-members-starred-only', '1')
+    setWindowWidth(NARROW_WINDOW)
+    await renderPage([row({ name: 'alpha', slug: 'alpha' }), row({ name: 'beta', slug: 'beta' })])
+    const roster = await screen.findByTestId('member-roster')
+    expect(roster).toHaveAttribute('data-rail', 'true')
+    await rosterRow('alpha')
+    await rosterRow('beta')
+    expect(screen.queryByTestId('member-filtered-out')).toBeNull()
+    fireEvent.click(screen.getByTestId('member-roster-toggle'))
+    expect(await screen.findByTestId('member-filtered-out')).toBeInTheDocument()
+    expect(within(roster).queryByText('alpha')).toBeNull()
+  })
+
+  it('a failed patrol-registry read unfolds the rail so its roster-level notice shows', async () => {
+    setWindowWidth(NARROW_WINDOW)
+    ;(api.autonudgeList as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('boom'))
+    await renderPage([row()])
+    expect(await screen.findByTestId('member-roster-patrol-error')).toBeInTheDocument()
+    expect(screen.getByTestId('member-roster')).not.toHaveAttribute('data-rail')
+  })
+
+  it('an empty roster unfolds the rail so its "no one yet" copy and create button have room', async () => {
+    setWindowWidth(NARROW_WINDOW)
+    await renderPage([])
+    const roster = await screen.findByTestId('member-roster')
+    expect(await screen.findByTestId('member-empty-cta')).toBeInTheDocument()
+    expect(roster).not.toHaveAttribute('data-rail')
+  })
+
+  it('a failed roster read unfolds the rail so the notice has room', async () => {
+    setWindowWidth(NARROW_WINDOW)
+    ;(api.members as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('boom'))
+    renderWithProviders(<MembersPage />)
+    expect(await screen.findByText(/Could not load the member roster/i)).toBeInTheDocument()
+    expect(screen.getByTestId('member-roster')).not.toHaveAttribute('data-rail')
+    expect(screen.getByTestId('member-count')).toHaveTextContent('\u2014')
   })
 
   it('the edit affordance lives in the Crew summary tab only and navigates to this member\'s editor in the crew manager', async () => {
