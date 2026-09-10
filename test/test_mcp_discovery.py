@@ -2730,7 +2730,7 @@ class TestProbeTempContainment:
         texts = [
             r.getMessage() for r in caplog.records if "ignoring spec-declared" in r.getMessage()
         ]
-        assert len(texts) == 1 and "TMPDIR=//declared/tmp" in texts[0]
+        assert len(texts) == 1 and "TMPDIR='//declared/tmp'" in texts[0]
         assert phrase in texts[0]
         if cause != "sealed":
             assert "sandbox-sealed" not in texts[0]

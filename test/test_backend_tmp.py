@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pytest
 
+from kiro_crew import sandbox as sandbox_mod
 from kiro_crew.mcp_gateway import backend_tmp as bt
 
 
@@ -87,6 +88,51 @@ class TestTmpEnv:
     def test_triple_points_at_the_dir(self, tmp_path: Path) -> None:
         env = bt.tmp_env(tmp_path)
         assert env == {"TMPDIR": str(tmp_path), "TMP": str(tmp_path), "TEMP": str(tmp_path)}
+
+
+class TestDeclaredTempClassification:
+    def test_unsealed_keys_are_returned_in_canonical_order(self, monkeypatch) -> None:
+        monkeypatch.setattr(sandbox_mod, "classify_declared_temp_path", lambda _path: None)
+
+        accepted, refused, failure = sandbox_mod.classify_declared_temp_env(
+            {"Temp": "/capacity/temp", "tmpdir": "/capacity/tmpdir"}
+        )
+
+        assert accepted == ("TMPDIR", "TEMP")
+        assert refused == {}
+        assert failure == ""
+
+    def test_one_refusal_drops_the_whole_declaration(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            sandbox_mod,
+            "classify_declared_temp_path",
+            lambda path: "sealed" if path.endswith("sealed") else None,
+        )
+
+        accepted, refused, failure = sandbox_mod.classify_declared_temp_env(
+            {"TMPDIR": "/runtime/sealed", "TMP": "/capacity/tmp"}
+        )
+
+        assert accepted == ()
+        assert refused == {"TMPDIR": ("/runtime/sealed", "sealed")}
+        assert failure == ""
+
+    def test_check_failure_refuses_every_declared_key(self, monkeypatch) -> None:
+        def _raise(_path: str) -> None:
+            raise OSError("classifier unavailable")
+
+        monkeypatch.setattr(sandbox_mod, "classify_declared_temp_path", _raise)
+
+        accepted, refused, failure = sandbox_mod.classify_declared_temp_env(
+            {"tmpdir": "/one", "TEMP": "/two"}
+        )
+
+        assert accepted == ()
+        assert refused == {
+            "TMPDIR": ("/one", "check-failed"),
+            "TEMP": ("/two", "check-failed"),
+        }
+        assert failure == "OSError: classifier unavailable"
 
 
 class TestSweepOne:

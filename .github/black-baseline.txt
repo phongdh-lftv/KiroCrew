@@ -274,7 +274,6 @@ src/kiro_crew/mcp_cleanup.py
 src/kiro_crew/mcp_gateway/abort.py
 src/kiro_crew/mcp_gateway/app_call.py
 src/kiro_crew/mcp_gateway/apps.py
-src/kiro_crew/mcp_gateway/backend.py
 src/kiro_crew/mcp_gateway/breaker.py
 src/kiro_crew/mcp_gateway/claim.py
 src/kiro_crew/mcp_gateway/evaluate.py
@@ -785,7 +784,6 @@ test/test_mcp_cron_security.py
 test/test_mcp_custom_api.py
 test/test_mcp_dashboard_registration.py
 test/test_mcp_gateway_apps_spool.py
-test/test_mcp_gateway_backend_coverage.py
 test/test_mcp_gateway_claim.py
 test/test_mcp_gateway_cluster_fixes.py
 test/test_mcp_gateway_control_plane.py
@@ -803,7 +801,6 @@ test/test_mcp_gateway_stub_poolable_ack.py
 test/test_mcp_gateway_stub_recaller.py
 test/test_mcp_gateway_transport.py
 test/test_mcp_gateway_wedge_ping_gate.py
-test/test_mcp_gatewayd_coverage.py
 test/test_mcp_internal_caller.py
 test/test_mcp_knowledge_add_document.py
 test/test_mcp_oauth_banner.py
