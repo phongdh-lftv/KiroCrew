@@ -103,6 +103,7 @@ from kiro_crew.dashboard.chat_utils import (
     _redact_meta_for_role,
     _redact_tool_field,
     _remove_queued_by_id,
+    _tool_identity_fields,
     _validate_tool_name,
     build_recovery_requeue,
     effective_session_key,
@@ -2374,6 +2375,13 @@ def _tool_meta(event: "LLMEvent") -> dict[str, str] | None:
         # happens to look like a diff is never promoted; persisting it keeps
         # historical rows gate-able identically to live ones.
         "kind": _redact_tool_field(event.tool_kind, limit=64),
+        # Trusted tool identity from ``_meta.kiro`` (empty when the backend sent
+        # none). The dashboard's title derivation reads these for MCP calls so a
+        # replayed row does not have to parse ``@server/tool`` out of the title;
+        # both are optional there, so an older row without them still renders.
+        "tool_name": "",
+        "mcp_server": "",
+        **_tool_identity_fields(event),
     }
 
 
@@ -2398,6 +2406,7 @@ def _tool_call_ws_payload(event: "LLMEvent") -> dict[str, str | bool]:
         "tool_call_id": _redact_tool_field(event.tool_call_id),
         "purpose": _redact_tool_field(event.tool_purpose, limit=_MAX_TOOL_PURPOSE),
         "input_preview": _redact_tool_field(event.tool_input),
+        **_tool_identity_fields(event),
     }
 
 
@@ -8170,6 +8179,7 @@ async def _run_chat(
                             # supplied", so an empty value would blank a good
                             # purpose (the session list's running-status line).
                             **({"purpose": _purpose_upd} if _purpose_upd else {}),
+                            **_tool_identity_fields(event),
                         },
                     )
                     # Update the audit log so the SEL trail captures the
@@ -9450,6 +9460,11 @@ async def _run_chat(
                 _safe_title, _ = redact_credentials(_safe_title)
                 perm_meta["tool_title"] = _safe_title
                 perm_meta["is_shell"] = "1" if event.is_shell else ""
+                # Kind + trusted identity let the approval card derive the same
+                # human title the tool row shows (utils/toolCallTitle). All
+                # optional there: a card missing them still renders its command.
+                perm_meta["tool_kind"] = _redact_tool_field(event.tool_kind or "", limit=64)
+                perm_meta.update(_tool_identity_fields(event))
                 _trust_key = approval_command(
                     event.tool_input or "",
                     is_shell=event.is_shell,

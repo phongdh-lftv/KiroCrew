@@ -39,6 +39,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import time
 from typing import Any, Awaitable, Callable
 
@@ -112,6 +113,27 @@ PARTIAL_TURN_MARKER = (
     "Everything above was already established — continue from this point instead of "
     "starting the request over.]_"
 )
+
+
+# MCP name separator: a run of >= 2 underscores (``<server>___<tool>`` and
+# ``mcp__<server>__<tool>`` alike). Mirrors ``channel._MCP_SEPARATOR_RE``.
+_MCP_SEPARATOR_RE = re.compile(r"_{2,}")
+
+
+def _is_wait_identity(tool_name: str) -> bool:
+    """True when a tool's programmatic name is the kirocrew-core ``wait`` tool.
+
+    Transports spell the identity three ways — ``wait`` (direct MCP),
+    ``kirocrew-core___wait`` (pooled gateway namespacing), ``mcp__kirocrew-core__wait``
+    (the ``mcp__<server>__<tool>`` form). Split on the LAST run of two or more
+    underscores and compare the final segment — the normalization
+    ``channel._blocked_tool_named`` and ``session_directive.match_tool`` already
+    share, mirrored here rather than re-spelled. A single underscore is not a
+    separator, so ``wait_for_ci`` stays a different tool and never rolls the
+    stream over.
+    """
+    name = (tool_name or "").strip().lower()
+    return bool(name) and _MCP_SEPARATOR_RE.split(name)[-1] == "wait"
 
 
 def _redact_all(text: str) -> str:
@@ -921,8 +943,17 @@ class SlackRenderer(Renderer):
         self._start_tool_timer()
         # The `wait` tool blocks MCP for up to 30min — finalize the streaming
         # message now so Slack doesn't show an error; the next text chunk opens
-        # a fresh stream when wait returns.
-        if tool_name == "wait" and self._use_slack_stream and self._stream_ts:
+        # a fresh stream when wait returns. Keyed on the tool's programmatic
+        # identity (Renderer.current_tool_name, from the transport's
+        # `_meta.kiro.toolName`): `title` is display copy — the derived
+        # `Wait` / `Wait: <reason>` — and must not drive behaviour. The title
+        # equality is the fallback for a transport that sent no identity.
+        is_wait = (
+            _is_wait_identity(self.current_tool_name)
+            if self.current_tool_name
+            else tool_name == "wait"
+        )
+        if is_wait and self._use_slack_stream and self._stream_ts:
             if self._active_task_id:
                 elapsed = self._tool_elapsed_str()
                 self._cancel_tool_timer()
