@@ -17,6 +17,7 @@ import PendingQuestionCard from './PendingQuestionCard'
 import QueueStack, { SubagentDeliveryProgress, splitPaneMessages } from './QueueStack'
 import SubagentProgressBar from '../pages/chat/SubagentProgressBar'
 import ChatFooter from '../pages/chat/ChatFooter'
+import EarlierMessagesBar from '../pages/chat/EarlierMessagesBar'
 import PinnedPrompt from '../pages/chat/PinnedPrompt'
 import { usePinnedPrompt } from '../pages/chat/usePinnedPrompt'
 import type { DisplayItem } from '../pages/chat/types'
@@ -35,7 +36,7 @@ import { usePlanActionMutation, isPlanAction } from '../hooks/usePlanActionMutat
 import { useQueuedMessageActions, queuedSendStash } from '../hooks/useQueuedMessageActions'
 import { useListboxKeyboard } from '../hooks/useListboxKeyboard'
 import { useAppSelector, useAppDispatch, store } from '../store'
-import { PANE_HYDRATE_LIMIT, retireStatelessQuestion, captureStatelessCard, capturePendingAskId, confirmOptimisticSend, resolveOptimisticSteer, selectSlotMessages, selectSendConfirmed, selectSlotStreamState, selectSlotRunEpoch, selectComposerBusy, hydrateSlotMessages, appendSlotMessage, requestStop, syncSlotRunningFromServer, setAgentSwitchNotice, pendingQuestionFor } from '../store/chatSlice'
+import { PANE_HYDRATE_LIMIT, SLOT_DETAIL_MAX_LIMIT, retireStatelessQuestion, captureStatelessCard, capturePendingAskId, confirmOptimisticSend, resolveOptimisticSteer, selectSlotMessages, selectSendConfirmed, selectSlotStreamState, selectSlotRunEpoch, selectComposerBusy, hydrateSlotMessages, appendSlotMessage, requestStop, syncSlotRunningFromServer, setAgentSwitchNotice, pendingQuestionFor } from '../store/chatSlice'
 import { handleStopPress, isEscalationState } from '../utils/stopDebounce'
 import { deriveFollowUpOptions } from '../app-sdk/protocol'
 import { CONTENT_WIDTH, loadChatConfig, type ChatConfig } from '../pages/chat/ChatSettings'
@@ -462,26 +463,34 @@ export default function ChatPane({
   // One-time hydrate of this slot's message history via React Query + the api
   // client (caching + cross-pane dedup; staleTime Infinity keeps it one-shot —
   // live updates arrive through the WS store routing, not a refetch).
-  // Unbounded while streaming is deliberate, not a raw-row guard: the handler
-  // collapses chunk runs BEFORE computing total and slicing, even mid-stream.
-  // A background slot's stream state reads idle until an SSE frame arrives, so
-  // the slot record is the signal; latch only once unbounded so a turn that starts
-  // while the bounded fetch is still in flight can still upgrade it.
-  const limitRef = useRef<number | undefined>(PANE_HYDRATE_LIMIT)
-  const limitLatched = useRef(false)
-  if (!limitLatched.current && (running || paneSlot?.running)) {
-    limitRef.current = undefined
-    limitLatched.current = true
-  }
-  const hydrateLimit = limitRef.current
-  const { data: slotDetail, isError: slotDetailFailed, refetch: refetchSlotDetail } = useQuery({
+  // Bounded whether or not the slot is running (#10005). A running slot used to
+  // lift the bound and latch it, on the theory that a limit would slice the
+  // in-flight response's raw chunk rows; the handler collapses chunk runs
+  // BEFORE it computes total and slices, so that hazard never existed, and the
+  // lift made a long-lived thread (a Crew Members DM is almost always running)
+  // pull and render its whole persisted transcript on every open. The rows a
+  // turn produces reach the pane over the WS routing, not this fetch, so a
+  // bounded page is all the history the pane has to fetch.
+  // The window WIDENS a page at a time when the reader asks for earlier history
+  // (the load-earlier bar below): each step re-asks the handler for a wider
+  // newest-N window and `hydrateSlotMessages` accepts the wider bounded page over
+  // the held one. Sized in whole pages up to the handler's own cap; a real
+  // cursor-based pager (P5-e, #10005) replaces this. Reset per slot, so a pane
+  // rebound to another slot starts at one page again.
+  const [hydrateLimit, setHydrateLimit] = useState(PANE_HYDRATE_LIMIT)
+  useEffect(() => { setHydrateLimit(PANE_HYDRATE_LIMIT) }, [slotKey])
+  const { data: slotDetail, isError: slotDetailFailed, isFetching: slotDetailFetching, refetch: refetchSlotDetail } = useQuery({
     queryKey: ['slot-messages', slotKey, hydrateLimit],
     queryFn: () => api.chatSlotDetail(slotKey, hydrateLimit),
     staleTime: Infinity,
   })
   useEffect(() => {
-    if (slotDetail?.messages) dispatch(hydrateSlotMessages({ slot: slotKey, messages: slotDetail.messages, hasMore: slotDetail.has_more, bounded: hydrateLimit !== undefined, total: slotDetail.total, running: slotDetail.running }))
-  }, [slotDetail, slotKey, dispatch, hydrateLimit])
+    if (slotDetail?.messages) dispatch(hydrateSlotMessages({ slot: slotKey, messages: slotDetail.messages, hasMore: slotDetail.has_more, bounded: true, total: slotDetail.total, running: slotDetail.running }))
+  }, [slotDetail, slotKey, dispatch])
+  const canWidenHydrate = hydrateLimit < SLOT_DETAIL_MAX_LIMIT
+  const widenHydrate = useCallback(() => {
+    setHydrateLimit((l) => Math.min(SLOT_DETAIL_MAX_LIMIT, l + PANE_HYDRATE_LIMIT))
+  }, [])
 
   // Scroll follow (auto-pin, release, jump pill) is owned by useChatScrollFollow
   // above — the ResizeObserver on the content wrapper replaces the old
@@ -1258,6 +1267,19 @@ export default function ChatPane({
             >
               {i18nT('components.chatPane.earlier_messages_open_session')}
             </button>
+          )}
+          {/* A host with no full session to open (the Crew Members DM) loads the
+              earlier history in place instead: the bar widens the bounded window a
+              page at a time, so the newest-50 page the pane opens on is never the
+              end of the road (#10005). Hidden once the window reaches the handler's
+              cap; the cursor-based pager of P5-e takes over from there. */}
+          {warmHasMore && slotKey !== activeSlot && !onOpenFull && canWidenHydrate && (
+            <EarlierMessagesBar
+              loading={slotDetailFetching}
+              failed={slotDetailFailed}
+              onLoad={widenHydrate}
+              onFocusRelease={() => follow.scrollerRef.current?.focus()}
+            />
           )}
           <ChatMessageList messages={messages} running={running} renderers={renderers} hideCardOwnedOAuth={connectionsUiOn} onDisplayItems={onDisplayItems} hiddenRow={pinHiddenRow} onQuote={onQuote} onAsk={onAsk} />
           {/* The same working indicator the full chat page shows (the ghost-pose

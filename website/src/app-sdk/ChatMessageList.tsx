@@ -1,11 +1,16 @@
 /**
- * ChatMessageList — shared message rendering for ChatPage and ChatEmbed.
+ * ChatMessageList — shared message rendering for the non-page chat surfaces:
+ * ChatPane (Crew Members DM, split panes), SideChat, ChatEmbed and the
+ * spec-builder ChatColumn.
  *
  * Renders messages with the same turn grouping, collapsible tool groups,
  * and component hierarchy as ChatPage. No Redux, no React Router.
  *
- * ChatPage wraps this in Virtuoso for virtualized scrolling.
- * ChatEmbed wraps this in a simple scrollable div.
+ * Unvirtualized: every display item is mounted (`displayItems.map`). ChatPage
+ * does NOT use this list -- it runs its own virtualized transcript
+ * (`hooks/virtualizer/useVirtualChat` + `pages/chat/TranscriptScrollShell`),
+ * which chat-core P5-e (#10005) brings to these hosts. Each host wraps this
+ * list in its own scroll container.
  */
 import React, { useMemo, useCallback, useLayoutEffect, memo } from 'react'
 import CollapsibleToolGroup from '../pages/chat/CollapsibleToolGroup'
