@@ -42,7 +42,7 @@ import { CONTENT_WIDTH, loadChatConfig, type ChatConfig } from '../pages/chat/Ch
 import { tryQuickSend } from '../lib/quickSend'
 import { mergeRecoveredDraft } from '../utils/chatDrafts'
 import { takePaneDraft, writePaneDraft, mergePaneDraft, subscribePaneDraft } from '../utils/chatPaneDrafts'
-import { sendTurn, type SendReceiptStatus } from '../chat-core/transport/sendTurn'
+import { sendTurn, mintSendId, type SendReceiptStatus } from '../chat-core/transport/sendTurn'
 import { useSelectionQuoteAsk } from '../chat-core/composer/selectionActions'
 import FlyingQuote from './FlyingQuote'
 import { revealComposer } from '../pages/chat/composerFocus'
@@ -735,7 +735,7 @@ export default function ChatPane({
     // content-equality fallback can never reconcile the server echo against
     // the optimistic bubble — without this id the echo appends a SECOND user
     // bubble carrying the raw marker.
-    const sendId = `s-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+    const sendId = mintSendId()
     // Optimistic user bubble: show immediately in the right position (mirrors the
     // single-chat send). Skipped while busy (main turn streaming OR sub-agents
     // running). A real queue has its own card; an immediate dispatch supplies

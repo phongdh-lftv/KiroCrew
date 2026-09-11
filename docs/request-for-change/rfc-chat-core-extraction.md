@@ -6,7 +6,7 @@ created: 2026-08-22
 last-audited: 2026-09-05
 audited-at: 8ed028b0b
 doc-pr:
-implementation-prs: ["#5128", "#5909", "#8599", "#8631", "#8655", "#8689", "#9576", "#9593"]
+implementation-prs: ["#5128", "#5909", "#8599", "#8631", "#8655", "#8689", "#9576", "#9587", "#9593"]
 tracking-issues: ["#8651", "#9570"]
 supersedes: []
 superseded-by: []
@@ -89,11 +89,11 @@ Background: P3's ChatEmbed adoption (#8631) mounts the real `ChatInput`, whose s
 | P2 | ChatPane → `sendTurn` | #5909 | merged |
 | P2 | ChatEmbed + app-sdk seed → `sendTurn` over an app-sdk wire; receipt policy; injectable `SendWire` | [#8599](https://github.com/kirodotdev/KiroCrew/pull/8599) | review-ready (carries #8631) |
 | P3 | ChatEmbed mounts the real `ChatInput` (fail-closed `embedded` preset) | [#8631](https://github.com/kirodotdev/KiroCrew/pull/8631) | merged into #8599's branch |
-| P2 | SideChat → `sendTurn` over a `/side/*` wire; shared core-owned receipt copy; `AcceptedBodyUnreadable` | [#8655](https://github.com/kirodotdev/KiroCrew/pull/8655) | in review (stacked on #8599) |
+| P2 | SideChat → `sendTurn` over a `/side/*` wire; shared core-owned receipt copy; `AcceptedBodyUnreadable` | [#8655](https://github.com/kirodotdev/KiroCrew/pull/8655) | folded into #8599 |
 | P2 | ChatPage send + steer → `sendTurn` (`steer`, `colorTheme` flags) | [#8689](https://github.com/kirodotdev/KiroCrew/pull/8689) | in review |
 | P2 | issue-radar / auto-improvement `agentSession` seeds → `sendTurn` (#9570 batch A) | [#9576](https://github.com/kirodotdev/KiroCrew/pull/9576) | in review |
-| P2 | design-critique, design-tweak, mochi `panelBridge` → `sendTurn`; receipt defects fixed (#9570 batch B) | — | not started |
-| P2 | `useSceneInteraction` (last `api.steerChat` caller), `App.tsx` feedback → `sendTurn`; `api.steerChat` deleted (#9570 batch C) | [#9593](https://github.com/kirodotdev/KiroCrew/pull/9593) | in review (stacked on #9576) |
+| P2 | design-critique, design-tweak, mochi `panelBridge` → `sendTurn`; receipt defects fixed (#9570 batch B) | [#9587](https://github.com/kirodotdev/KiroCrew/pull/9587) | folded into #8599 |
+| P2 | `useSceneInteraction` (last `api.steerChat` caller), `App.tsx` feedback → `sendTurn`; `api.steerChat` deleted (#9570 batch C) | [#9593](https://github.com/kirodotdev/KiroCrew/pull/9593) | merged |
 | P3 | Store-free `ChatInput` seam | [#8651](https://github.com/kirodotdev/KiroCrew/issues/8651) | design draft pending |
 | P3-b | `Composer` root + root-mounted Voice atom (`chat-core/composer/`): dictation orchestration leaves `ChatPage` for the atom, the root mounts it and `ChatInput` reads its state from the root's context (23 voice props deleted), ChatPage behaviour unchanged, ChatPane wraps the `ChatInput` preset in the root and gains dictation. One mic across all mounted composers; transcript inbox becomes multi-subscriber with owner claim and holds an unowned transcript until its composer is back on screen | [#9787](https://github.com/kirodotdev/KiroCrew/pull/9787) (closes [#9775](https://github.com/kirodotdev/KiroCrew/issues/9775)) | in review |
 | P3-c | `Composer.Paste` atom (long-paste collapse: expand-on-send, carry-back, bubble store); panes gain it | — | not started |
@@ -104,7 +104,7 @@ Background: P3's ChatEmbed adoption (#8631) mounts the real `ChatInput`, whose s
 | P5-d | Pinned-prompt banner sinks into `ChatPane` (Crew Members DM, split panes): `usePinnedPrompt` hook extracted from the transcript controller, `ChatMessageList` `onDisplayItems` / `hiddenRow` row-indexing seam | [#9538](https://github.com/kirodotdev/KiroCrew/pull/9538) | in review |
 | P4 | Error hand-off → side panel; `askAgent` default-on | — | after P5-a |
 
-Follow-ups recorded during review, not yet scheduled: route SideChat's four remaining panel-local statuses (queue cancel/edit failure, question-too-long, demotion notice) through the per-slot `sideSendStatus` store channel (#8655 FP); design-critique's `SyntaxError` swallow (its own P2 slot).
+Follow-ups recorded during review, not yet scheduled: route SideChat's four remaining panel-local statuses (queue cancel/edit failure, question-too-long, demotion notice) through the per-slot `sideSendStatus` store channel (#8655 FP).
 
 ### 4.3 P4 scoping — non-destructive error hand-off, `askAgent` default-on (2026-09-05, measured at `main` e76341d16)
 
