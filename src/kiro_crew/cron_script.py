@@ -59,7 +59,12 @@ from kiro_crew.sandbox import (
     wrap_argv,
 )
 from kiro_crew.secrets import SecretVault
-from kiro_crew.security import is_sensitive_path, redact
+from kiro_crew.security import (
+    _REDACTED_CREDENTIAL_TAG,
+    _STREAM_HOLDBACK_JWT_MAX,
+    is_sensitive_path,
+    redact,
+)
 from kiro_crew.sel import sel
 
 # Env vars stripped from EVERY cron subprocess (command and script), regardless
@@ -1502,6 +1507,71 @@ def _resolve_dial_port() -> int:
     return resolve_serving_port()
 
 
+# How far BEYOND its kept slice each diagnostic-site pattern redaction reads. A
+# credential straddling the slice boundary is only detectable while the bytes
+# on the far side are still present -- but redacting the WHOLE capture to get
+# them costs a multiple of an unbounded string (``proc.communicate`` caps
+# neither stream, and ``redact_credentials`` materialises its base64 runs), so
+# a script streaming gigabytes would OOM the gateway in redaction that survived
+# capture. Redacting a fixed window that overshoots the slice by the streaming
+# redactor's credential-holdback ceiling keeps the footprint constant. Two
+# credential classes are exempted from the margin because a fixed window
+# cannot cover them: granted vault values (shapeless, unbounded -- so
+# ``_scrub_grant_values`` runs over the whole capture BEFORE the window is
+# cut; exact-substring replacement carries none of the amplification this
+# window exists to bound) and PEM blocks on a tail-keeping window (no length
+# ceiling -- ``_pem_safe_tail_window`` tracks open-block state across the
+# discarded prefix and masks through the END line). The remaining residual is
+# an anchor-bearing credential longer than this margin straddling the window
+# edge (e.g. a 4096+ char JWT), the same length at which the streaming
+# redactor itself already fails closed by dropping the tail.
+_REDACT_STRADDLE_MARGIN = _STREAM_HOLDBACK_JWT_MAX
+
+# How much of a failed script's stderr is reported, taken from the END.
+_MAX_SCRIPT_STDERR_TAIL = 500
+
+# How much of an unparsable script stdout is reported, taken from the START.
+_MAX_BAD_OUTPUT_HEAD = 200
+
+#: PEM block markers, as the batch redactor anchors on them. A PEM block is the
+#: one recognisable credential class with NO length ceiling, so it is the one
+#: class the straddle margin cannot cover on a tail-keeping window.
+_PEM_BEGIN_MARKER = "-----BEGIN "
+_PEM_END_MARKER = "-----END "
+
+
+def _pem_safe_tail_window(text: str, keep: int) -> str:
+    """Return the pattern-redaction input for a TAIL-keeping ``keep`` slice.
+
+    The window is the last ``keep + _REDACT_STRADDLE_MARGIN`` chars of
+    ``text``. A PEM block has no length ceiling, so a block that OPENED before
+    the window start loses its ``-----BEGIN `` anchor: the body lines inside
+    the window would evade pattern redaction entirely and reach the kept tail.
+    Track open-block state across the discarded prefix -- two bounded
+    ``rfind`` scans, no copies, so the memory footprint stays that of the
+    window -- and when the window starts inside an open block, mask the
+    retained bytes through the block's END line (or the whole window when the
+    block never closes).
+    """
+    start = len(text) - (keep + _REDACT_STRADDLE_MARGIN)
+    if start <= 0:
+        return text
+    window = text[start:]
+    last_begin = text.rfind(_PEM_BEGIN_MARKER, 0, start)
+    if last_begin == -1:
+        return window
+    last_end = text.rfind(_PEM_END_MARKER, 0, start)
+    if last_end > last_begin:
+        return window
+    # The window starts inside an open PEM block.
+    close = window.find(_PEM_END_MARKER)
+    if close == -1:
+        return _REDACTED_CREDENTIAL_TAG
+    close_nl = window.find("\n", close)
+    kept_after = window[close_nl + 1 :] if close_nl != -1 else ""
+    return _REDACTED_CREDENTIAL_TAG + "\n" + kept_after
+
+
 def run_script_sandboxed(
     script_path: str,
     job_id: str,
@@ -1889,12 +1959,22 @@ def run_script_sandboxed(
             # budget, and so an all-whitespace stderr still falls through to the
             # exit-code fallback rather than reporting blank text.
             #
-            # Redact the WHOLE stream before bounding: slicing first would cut
-            # a credential that straddles the 500-char boundary in half, and
-            # ``redact`` cannot recognise the surviving fragment, so it would
-            # reach logs and the persisted ``last_error`` unmasked.
-            tail = redact(_scrub_grant_values(stderr.rstrip(), resolved_secret_env))
-            error_text = tail[-500:] if tail else f"exit {proc.returncode}"
+            # Redact BEFORE bounding: slicing first would cut a credential that
+            # straddles the 500-char boundary in half, and ``redact`` cannot
+            # recognise the surviving fragment, so it would reach logs and the
+            # persisted ``last_error`` unmasked. The two passes get DIFFERENT
+            # inputs, matching what each costs and needs. The grant scrub runs
+            # over the WHOLE capture: it is exact-substring replacement of
+            # values the parent already holds -- O(len) scans, no base64
+            # materialisation -- and a vault value has no shape, so a value
+            # straddling any window edge would stop matching ``value in text``
+            # and its fragment would leak with nothing downstream able to
+            # recognise it. Pattern ``redact`` is the memory amplifier, so ITS
+            # input is a TAIL window reaching ``_REDACT_STRADDLE_MARGIN`` back
+            # past the kept region (see ``_REDACT_STRADDLE_MARGIN``).
+            scrubbed = _scrub_grant_values(stderr.rstrip(), resolved_secret_env)
+            tail = redact(_pem_safe_tail_window(scrubbed, _MAX_SCRIPT_STDERR_TAIL))
+            error_text = tail[-_MAX_SCRIPT_STDERR_TAIL:] if tail else f"exit {proc.returncode}"
             return {"status": "error", "error": error_text}
 
         try:
@@ -1915,12 +1995,19 @@ def run_script_sandboxed(
                         parsed[k] = _scrub_grant_values(v, resolved_secret_env)
             return parsed
         except (json.JSONDecodeError, IndexError):
+            # Redact BEFORE truncating: slicing first could cut a credential at
+            # the boundary, leaving its unredacted head in the diagnostic. Same
+            # split as the stderr tail above: the grant scrub reads the WHOLE
+            # capture (shapeless values, cheap exact replacement), pattern
+            # ``redact`` reads a HEAD window overshooting the kept region by
+            # ``_REDACT_STRADDLE_MARGIN``.
+            scrubbed_out = _scrub_grant_values(stdout, resolved_secret_env)
             return {
                 "status": "error",
-                # Redact the complete stdout BEFORE truncating: slicing first
-                # could cut a credential at the boundary, leaving its unredacted
-                # head in the diagnostic.
-                "error": f"Bad output: {redact(_scrub_grant_values(stdout, resolved_secret_env))[:200]}",
+                "error": (
+                    "Bad output: "
+                    f"{redact(scrubbed_out[: _MAX_BAD_OUTPUT_HEAD + _REDACT_STRADDLE_MARGIN])[:_MAX_BAD_OUTPUT_HEAD]}"
+                ),
             }
     except subprocess.TimeoutExpired:
         return {"status": "error", "error": f"Script timed out after {timeout}s"}
