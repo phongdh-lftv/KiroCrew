@@ -294,6 +294,51 @@ _MARKER_LABEL_PAIR = (
     rf"(?![ \t]*[|,]|{_MARKER_CLOSE_CLASS})"
 )
 
+#: A bare opener may not be the one whose partner closer ENDS the marker.
+#:
+#: The bare-``[`` alternative exists so a stray opener inside a label does not
+#: sink the whole marker: ``[OPTIONS: Fix [x logging | Skip]`` parses, and is
+#: tested. But nothing about it distinguishes that opener from the one in
+#: ``[OPTIONS: A | B then check arr[0]``, where the marker was never closed and
+#: the ``]`` of ``arr[0]`` is the only closer on the line. There the body ran on
+#: through the prose, that ``]`` became the terminator, and since every consumer
+#: removes the whole match, the line was deleted from the message and came back
+#: as the label ``B then check arr[0``.
+#:
+#: What separates the two is where the opener sits relative to the END, not the
+#: brackets themselves -- the two shapes are otherwise identical token for token,
+#: which is why no rule over bracket structure alone can tell them apart. So the
+#: bare form is refused exactly when nothing but ordinary text lies between it
+#: and a closer at the end anchor: that closer is then its partner rather than
+#: the marker's, and the marker is unterminated.
+#:
+#: Crossing a SEPARATOR clears the gate, because the opener is then inside a
+#: label and the list continues past it. Crossing another BRACKET clears it too,
+#: because some other bracket form owns the closer -- which is what keeps
+#: ``[OPTIONS: Fix arr[0] | Skip]`` (the continuation half admits that ``]``) and
+#: ``[OPTIONS: a[1] | b[2]]`` parsing.
+#:
+#: Spelled twice because the two bodies end differently: ``$`` under MULTILINE
+#: for LINE, ``\s*\Z`` under DOTALL for TRAILER. Both carry the optional stray
+#: markdown-link tic and a wrapper run, so a marker wearing either still gates on
+#: the same closer the tail would consume.
+#:
+#: ReDoS: the lookahead is TEMPERED -- its scan stops at the first bracket or
+#: separator, so the runs scanned from different openers are disjoint and the
+#: total work stays linear in the line. It adds no quantifier over a quantifier,
+#: which is the shape the frontend's ``.source`` pin forbids.
+_MARKER_TERMINATOR_SCAN = rf"[^[{re.escape(MARKER_CLOSERS)}|,\n]*"
+_MARKER_STRAY_TIC = r"(?:\([^\s()]*\))?"
+_MARKER_WRAP_RUN = rf"{_MARKER_WRAP_CLASS}{{0,3}}"
+_MARKER_BARE_OPENER_GATE_LINE = (
+    rf"(?!{_MARKER_TERMINATOR_SCAN}{_MARKER_CLOSE_CLASS}"
+    rf"{_MARKER_STRAY_TIC}{_MARKER_WRAP_RUN}[ \t]*$)"
+)
+_MARKER_BARE_OPENER_GATE_TRAILER = (
+    rf"(?!{_MARKER_TERMINATOR_SCAN}{_MARKER_CLOSE_CLASS}"
+    rf"{_MARKER_STRAY_TIC}{_MARKER_WRAP_RUN}\s*\Z)"
+)
+
 #: Label body, spelled once per regex so LINE and TRAILER cannot drift. LINE
 #: stops at a newline; TRAILER spans them (``DOTALL``, as the old ``.*`` did).
 #: The one body-shaped pattern NOT derived from these is
@@ -308,12 +353,12 @@ _MARKER_LABEL_PAIR = (
 #: closer. So there is never more than one way to consume a character, and each
 #: lookahead is entered only at a bracket and bounded by the run it scans.
 _MARKER_BODY_LINE = (
-    rf"(?:{_MARKER_LABEL_PAIR}|\[(?!OPTIONS:)"
+    rf"(?:{_MARKER_LABEL_PAIR}|\[(?!OPTIONS:){_MARKER_BARE_OPENER_GATE_LINE}"
     rf"|{_MARKER_CLOSE_CLASS}{_MARKER_LABEL_CONTINUES}"
     rf"|[^[{re.escape(MARKER_CLOSERS)}\n])*"
 )
 _MARKER_BODY_TRAILER = (
-    rf"(?:{_MARKER_LABEL_PAIR}|\[(?!OPTIONS:)"
+    rf"(?:{_MARKER_LABEL_PAIR}|\[(?!OPTIONS:){_MARKER_BARE_OPENER_GATE_TRAILER}"
     rf"|{_MARKER_CLOSE_CLASS}{_MARKER_LABEL_CONTINUES}"
     rf"|[^[{re.escape(MARKER_CLOSERS)}])*"
 )
