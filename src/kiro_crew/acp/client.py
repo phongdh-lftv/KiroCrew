@@ -82,9 +82,12 @@ from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_CODEX,
     ACP_BACKEND_KIRO,
+    ACP_BACKEND_OPENCODE,
     ACP_BACKENDS_ADVERTISED_MODEL_SELECTION,
+    ACP_BACKENDS_HARNESS_OWNED_SESSIONS,
     ACP_BACKENDS_HOST_AUTH_CALLBACK,
     ACP_BACKENDS_INTERNAL_SANDBOX,
+    ACP_BACKENDS_LOAD_WITHOUT_MODES,
     ACP_BACKENDS_MEMBER_DISPATCH,
     ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION,
     ACP_BACKENDS_POD_HOME_REMAP,
@@ -213,6 +216,21 @@ PROTOCOL_VERSION_CLAUDE = 1
 # H10 wants the handshake stated per harness, so a divergence is a one-line edit
 # here instead of a silent downgrade of whichever harness moved first.
 PROTOCOL_VERSION_CODEX = 1
+# OpenCode answers ``initialize`` with an integer ``protocolVersion`` of 1, so it
+# speaks the SPEC dialect rather than kiro-cli's date-stamped one. Verified off its
+# own wire, and its own literal for the same reason codex has one (harness-parity
+# H10): a divergence should be a one-line edit here, not a silent downgrade of
+# whichever harness moved first.
+PROTOCOL_VERSION_OPENCODE = 1
+#: Handshake dialect per harness. A TABLE, not an if-chain: the handshake runs on
+#: the construction path kiro-cli shares with every adapter, and harness-parity H13
+#: keeps that path free of conditionals added in service of one. A harness added
+#: later is one row here; an id with no row speaks kiro-cli's date-stamped dialect.
+_PROTOCOL_VERSION_BY_BACKEND: dict[str, int | str] = {
+    ACP_BACKEND_CLAUDE: PROTOCOL_VERSION_CLAUDE,
+    ACP_BACKEND_CODEX: PROTOCOL_VERSION_CODEX,
+    ACP_BACKEND_OPENCODE: PROTOCOL_VERSION_OPENCODE,
+}
 DEFAULT_MODEL = "auto"
 
 KIRO_CLI_BIN = "kiro-cli"
@@ -271,6 +289,34 @@ _ENV_CODEX_ACP_BIN = "CODEX_ACP_BIN"
 # who sets it reaches the child through the ambient environment copy, so naming it
 # here would imply a wiring that does not exist (its claude counterpart,
 # CLAUDE_CODE_EXECUTABLE, IS explicitly forwarded — the asymmetry is deliberate).
+
+# ── opencode (ACP_BACKEND_OPENCODE) ──
+# OpenCode serves ACP from its OWN binary: ``opencode acp``. There is no npm
+# adapter to resolve and no Node floor to satisfy -- the published package ships an
+# executable -- so the resolution ladder here is the plain-binary one
+# (``_resolve_claude_code_executable``'s shape), not the Node-entry-script one the
+# two adapters above need.
+OPENCODE_BIN = "opencode"
+OPENCODE_ACP_SUBCMD = "acp"
+# Explicit override, spelled the way this harness's own documentation spells it.
+_ENV_OPENCODE_BIN = "OPENCODE_BIN"
+# The channel Crew's permission routing travels down: inline config JSON in the
+# child's environment. It is what makes the routing seed session-scoped -- nothing
+# is written into a checked-out repository -- and it resolves ABOVE the project's
+# own config file, verified on this harness by resolving a project that declares
+# ``permission: "allow"`` and reading ``ask`` back out. The read-back is still what
+# establishes the guarantee; this is only how the value gets there.
+_ENV_OPENCODE_CONFIG_CONTENT = "OPENCODE_CONFIG_CONTENT"
+# The harness's own installer. Not an ``npm i -g`` of an adapter, because there is
+# no adapter: this installs the binary that serves ACP.
+OPENCODE_INSTALL_COMMAND = "npm i -g opencode-ai"
+# The subcommand that prints the RESOLVED configuration -- every source merged, the
+# way the ACP server itself resolves it. Reading it back is what separates this
+# harness's routing from a declared-but-unverified seed.
+_OPENCODE_CONFIG_READBACK_ARGS = ("debug", "config")
+# Bounded so a wedged harness cannot hold the spawn open: the read-back is a
+# short-lived child, measured at ~2.3s on a loaded dev desktop.
+_OPENCODE_READBACK_TIMEOUT_S = 30.0
 
 # High-frequency, content-free adapter stderr diagnostics that _drain_stderr()
 # drops instead of forwarding as per-line WARNINGs.  The driving case is the
@@ -654,6 +700,76 @@ def _resolve_claude_acp_bin() -> tuple[list[str] | None, str]:
             return [node_on_path, resolved], search_path
 
     return None, search_path
+
+
+_opencode_bin_cache: tuple[str | None, str] | object = _UNRESOLVED
+
+
+def _resolve_opencode_bin() -> tuple[str | None, str]:
+    """Find the opencode executable and the PATH searched for it.
+
+    Three rungs, the plain-binary ladder: explicit override, then mise, then the
+    augmented PATH. No ``node_modules`` rung and no node resolution, because this
+    harness is not a Node script -- it is a binary that serves ACP itself.
+
+    Returns ``(None, search_path)`` when it is absent, so the caller reports what
+    was searched rather than raising from inside the resolver.
+    """
+    search_path = augmented_path(os.environ.get("PATH", ""))
+
+    override = os.environ.get(_ENV_OPENCODE_BIN)
+    if override and platform_compat.is_executable_file(override):
+        return _normalize_exe_casing(override) or override, search_path
+
+    mise_resolved = _mise_which(OPENCODE_BIN)
+    if mise_resolved:
+        return mise_resolved, search_path
+
+    on_path = shutil.which(OPENCODE_BIN, path=search_path)
+    if on_path:
+        return _normalize_exe_casing(on_path) or on_path, search_path
+
+    return None, search_path
+
+
+def _opencode_readback_remedy() -> str:
+    """What an operator does when the harness's config cannot be read back at all."""
+    return (
+        f"Run '{OPENCODE_BIN} {' '.join(_OPENCODE_CONFIG_READBACK_ARGS)}' in the "
+        "session's working directory to see what fails, and reinstall with "
+        f"'{OPENCODE_INSTALL_COMMAND}' if the command itself is broken."
+    )
+
+
+def _unlink_readback_launcher(path: str) -> None:
+    """Remove a sandbox launcher artifact whose child has already exited."""
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def _opencode_uniform_permission(raw: object) -> object:
+    """Collapse this harness's resolved permission to ONE value when it is uniform.
+
+    The harness normalizes a bare ``"ask"`` into a rule map (``{"*": "ask"}``), so
+    the read-back has to compare shapes rather than strings. A map whose every rule
+    carries the same value IS that value. A MIXED map is not reduced and not
+    accepted: one tool left permissive is one tool whose calls never reach the host
+    gate, so it is returned as its own JSON spelling for the refusal to name.
+
+    ``None`` for anything else, which the gate reads as "the setting is not there".
+    """
+    if isinstance(raw, str):
+        return raw
+    if isinstance(raw, dict) and raw:
+        values = {value for value in raw.values() if isinstance(value, str)}
+        if len(values) == 1 and len(raw) == len(
+            [value for value in raw.values() if isinstance(value, str)]
+        ):
+            return values.pop()
+        return json.dumps(raw, sort_keys=True)
+    return None
 
 
 _codex_acp_argv_cache: tuple[list[str] | None, str] | object = _UNRESOLVED
@@ -3430,6 +3546,11 @@ class AcpClient:
         # unreadable), which makes the guard a no-op rather than a disk read on
         # the loop. Cleared on reset so the next spawn re-reads the spec.
         self._mcp_ref_spec: dict[str, Any] | None = None
+        # The inline harness config this session's routing seed travels in, resolved
+        # in the opencode spawn arm and read back there before the first prompt. The
+        # env section applies it; holding it here is what keeps that section a plain
+        # in-memory read rather than a second place that knows the mechanism.
+        self._opencode_config_content = ""
         self._session_key = session_key
         # When set, this client emits a per-tool-call SEL audit from the ACP
         # dispatch loop. Used by app/worker-pool clients (e.g. code-review-sage,
@@ -3682,6 +3803,10 @@ class AcpClient:
     @property
     def _is_codex(self) -> bool:
         return self.backend == ACP_BACKEND_CODEX
+
+    @property
+    def _is_opencode(self) -> bool:
+        return self.backend == ACP_BACKEND_OPENCODE
 
     @property
     def _model_registry_namespace(self) -> str:
@@ -4133,6 +4258,134 @@ class AcpClient:
         return seed_provenance.recorded(
             self._claude_local_settings_path(), getattr(self, "_seed_owner", "")
         )
+
+    def _opencode_routing_config(self) -> str:
+        """The inline harness config that makes this session ask, as one env value.
+
+        MERGED over an ambient value rather than replacing it: an operator who set
+        the variable themselves keeps every key they chose, and only the permission
+        setting the host gate depends on is Crew's. A value that is not a JSON
+        object is left out of the merge and said so in the log -- silently dropping
+        an operator's config would be worse, and honouring an unparseable one is not
+        possible.
+        """
+        setting_key, value = acp_tool_gate.permission_setting_for(self.backend)
+        merged: dict[str, Any] = {}
+        ambient = os.environ.get(_ENV_OPENCODE_CONFIG_CONTENT) or ""
+        if ambient:
+            try:
+                parsed = json.loads(ambient)
+            except ValueError:
+                logger.warning(
+                    "%s is not valid JSON, so this session's harness config carries only "
+                    "Crew's permission routing.",
+                    _ENV_OPENCODE_CONFIG_CONTENT,
+                )
+            else:
+                if isinstance(parsed, dict):
+                    merged.update(parsed)
+                else:
+                    logger.warning(
+                        "%s is not a JSON object, so this session's harness config carries "
+                        "only Crew's permission routing.",
+                        _ENV_OPENCODE_CONFIG_CONTENT,
+                    )
+        merged[setting_key] = value
+        return json.dumps(merged)
+
+    def _verify_opencode_routing(self, argv: list[str], config_content: str) -> tuple[str, str]:
+        """Read the harness's OWN resolved permission back, and report any issue.
+
+        This is the half that makes the routing VERIFIED rather than seeded. The
+        read-back runs the harness's own config resolution -- every source merged,
+        the way the ACP server itself merges them -- so what comes back is the value
+        the session will actually use, not the value Crew hoped it had written. A
+        precedence change in a future release therefore surfaces as a refusal here
+        instead of as a session that silently stops asking.
+
+        What it does NOT establish is that the harness HONOURS the setting per tool
+        call; that is the harness's own contract, and no client-side read can prove
+        it. The scope is the precondition, and the precondition is the part that was
+        missing.
+
+        Returns ``("", "")`` when the required value is in force, else the reason
+        and the remedy that can clear it. The two travel together because they are
+        decided together: a read-back that could not RUN or could not be PARSED is a
+        harness problem, and its remedy is to run the harness's own command and fix
+        the install; a value that resolved to something other than the required one
+        is a config problem, and its remedy is the gate's -- remove the source that
+        outranks the seed. Handing the config remedy to an exec failure would tell
+        the operator to edit something that cannot clear the refusal.
+
+        *argv* arrives ALREADY SANDBOX-WRAPPED, and that is a security property
+        rather than a convenience: this child is the same third-party binary the
+        session spawns, resolving config out of the session work dir, and config
+        resolution on this harness can load project plugins. An unwrapped child
+        would read the very credential homes the mask exists to deny it, moments
+        before the masked session spawn. The caller wraps because it is the async
+        side and has the resolved mask in hand.
+
+        Blocking (spawns a short-lived child); callers run it off the loop.
+        """
+        setting_key, _required = acp_tool_gate.permission_setting_for(self.backend)
+        # The SAME scrub the spawn below applies, and for the same reason: this is a
+        # foreign harness binary, and the gateway's own environment carries channel
+        # tokens, cloud secrets and an agent socket that no harness may see. The
+        # read-back runs BEFORE the spawn, so inheriting ``os.environ`` verbatim
+        # would hand a child every one of them a few lines ahead of the code that
+        # strips them.
+        env = scrub_agent_subprocess_env(_resolve_spawn_env({**os.environ}, kiro_api_key=False))
+        env["PATH"] = augmented_path(env.get("PATH", ""))
+        env[_ENV_OPENCODE_CONFIG_CONTENT] = config_content
+        try:
+            completed = subprocess_mod.run(
+                argv,
+                cwd=self._spawn_work_dir,
+                env=env,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=_OPENCODE_READBACK_TIMEOUT_S,
+            )
+        except (OSError, subprocess_mod.SubprocessError) as exc:
+            return (
+                f"the resolved configuration could not be read back ({exc})",
+                _opencode_readback_remedy(),
+            )
+        if completed.returncode != 0:
+            return (
+                "the resolved configuration could not be read back "
+                f"(exit {completed.returncode})",
+                _opencode_readback_remedy(),
+            )
+        # The harness prints a banner before the document, so the object is found
+        # rather than assumed to start at byte zero.
+        start = completed.stdout.find("{")
+        resolved: object = None
+        if start >= 0:
+            try:
+                resolved = json.loads(completed.stdout[start:])
+            except ValueError:
+                resolved = None
+        if not isinstance(resolved, dict):
+            return (
+                "the resolved configuration could not be parsed",
+                _opencode_readback_remedy(),
+            )
+        observed = _opencode_uniform_permission(resolved.get(setting_key))
+        if isinstance(observed, str):
+            # The value came out of the operator's own config and travels into a
+            # refusal that reaches the dashboard and the chat card, so it goes
+            # through the same two scrubs every other backend-sourced string in this
+            # module does. A rule map can name anything -- a URL, a token-shaped
+            # literal -- and a refusal is not a reason to publish it.
+            observed, _ = redact_exfiltration_urls(observed)
+            observed, _ = redact_credentials(observed)
+        issue = acp_tool_gate.seeded_setting_issue(self.backend, observed)
+        if not issue:
+            return "", ""
+        return issue, acp_tool_gate.remediation_for(self.backend)
 
     def _write_claude_local_settings(self) -> None:
         """Seed ``<work_dir>/.claude/settings.local.json`` for this session.
@@ -5448,6 +5701,95 @@ class AcpClient:
             # (a stalled home mount, a Windows directory open) back on the event
             # loop the preflight above exists to keep it off.
             adapter_expose = acp_tool_gate.adapter_expose_files(self.backend, adapter_hidden_dirs)
+        elif self._is_opencode:
+            # This harness serves ACP from its own binary, so the argv is that binary
+            # plus its ``acp`` subcommand: no adapter entry script, no node, and no
+            # npm package to resolve.
+            global _opencode_bin_cache  # noqa: PLW0603
+            if _opencode_bin_cache is _UNRESOLVED:
+                _opencode_bin_cache = await asyncio.to_thread(_resolve_opencode_bin)
+            cached_opencode_resolution = _opencode_bin_cache
+            opencode_bin, opencode_search_path = (
+                cached_opencode_resolution
+                if isinstance(cached_opencode_resolution, tuple)
+                else (None, "")
+            )
+            if not isinstance(opencode_bin, str) or not opencode_bin:
+                raise AcpError(
+                    f"{OPENCODE_BIN} not found "
+                    f"({describe_search_path(opencode_search_path)}). Install it with "
+                    f"'{OPENCODE_INSTALL_COMMAND}', or set {_ENV_OPENCODE_BIN} to the "
+                    f"executable. No adapter package is needed: this harness serves ACP "
+                    f"itself."
+                )
+            argv = [opencode_bin, OPENCODE_ACP_SUBCMD]
+            # The same refuse-then-mask preflight the codex arm runs, keyed on the
+            # same routing question rather than on this harness's identity: it is
+            # ENFORCED, so the OS credential mask is the compensating control for the
+            # passive reads ACP v1 cannot make it ask about, and several wrap_argv
+            # paths return without applying it. test_acp_tool_gate pins one call site
+            # per enforced harness so a new arm cannot forget it.
+            #
+            # FIRST, before the read-back below: that read-back runs a child of this
+            # harness, and on a host where the mask cannot be applied the session is
+            # refused anyway -- so refusing here means no foreign binary starts at
+            # all, rather than one starting and then being told the session is off.
+            adapter_hidden_dirs = await _run_preflight_bounded(
+                _sandbox_preflight, self.backend, self._sandbox_mode
+            )
+            adapter_expose = acp_tool_gate.adapter_expose_files(self.backend, adapter_hidden_dirs)
+            # The routing seed, and the READ-BACK that is what this harness's Routing
+            # member promises. OFF-LOOP: the read-back spawns a short-lived child, and
+            # a synchronous spawn on the gateway loop is the stall this path guards
+            # against everywhere else.
+            self._opencode_config_content = self._opencode_routing_config()
+            # Wrapped in the SAME sandbox, with the SAME credential mask, as the
+            # session spawn below. The read-back runs the harness's own binary, and
+            # this harness resolves its configuration by reading the work dir --
+            # which can load a project's plugins -- so an unwrapped read-back would
+            # hand a third-party binary the credential homes the mask denies it,
+            # moments before the masked spawn. The mask is already resolved above,
+            # which is what makes wrapping possible here at all.
+            readback_argv, readback_cleanup = await wrap_argv_async(
+                [opencode_bin, *_OPENCODE_CONFIG_READBACK_ARGS],
+                mode=self._sandbox_mode,
+                strip_python_env=True,
+                extra_hidden_dirs=adapter_hidden_dirs,
+                extra_expose_files=adapter_expose,
+                _prepare=wrap_argv,
+            )
+            try:
+                routing_issue, routing_remedy = await asyncio.to_thread(
+                    self._verify_opencode_routing,
+                    readback_argv,
+                    self._opencode_config_content,
+                )
+            finally:
+                # wrap_argv leaves a launcher/profile file the child consumes at
+                # exec. This child has exited by now, so the file is removed here
+                # rather than leaking one per session start for the gateway's life
+                # (the same contract ``_discard_sandbox_cleanup`` keeps for the
+                # spawn's own artifact, which this must not touch).
+                if readback_cleanup:
+                    await asyncio.to_thread(_unlink_readback_launcher, readback_cleanup)
+            if routing_issue:
+                # Refused before the first prompt: this harness asks per tool call
+                # only while the setting holds, so a session that cannot establish it
+                # is a session where none of Crew's tool controls execute.
+                #
+                # Translated to the ACP-layer type like the three sibling sites, and
+                # that is not cosmetic: ``ensure_ready`` catches
+                # ``AcpToolGateUnroutable``, so a bare gate exception would escape
+                # both of its handlers and skip ``_cleanup_failed_live_spawn`` --
+                # leaving the refusal untyped and the failed spawn unreaped.
+                try:
+                    acp_tool_gate.enforce_runtime_routing(
+                        self.backend,
+                        routing_issue,
+                        remedy=routing_remedy,
+                    )
+                except acp_tool_gate.ToolGateUnroutable as exc:
+                    raise AcpToolGateUnroutable(str(exc)) from None
         else:
             # Pin ONE reading of the environment for both the search and the
             # message that reports it. The previous code resolved against the live
@@ -5578,6 +5920,11 @@ class AcpClient:
                     "CLAUDE_CODE_EXECUTABLE.",
                     CLAUDE_CODE_BIN,
                 )
+        if self._is_opencode and self._opencode_config_content:
+            # The seed the read-back above verified, applied unconditionally: the
+            # merge in ``_opencode_routing_config`` already preserved every key the
+            # operator set, and this value is the one the host gate depends on.
+            env[_ENV_OPENCODE_CONFIG_CONTENT] = self._opencode_config_content
         if self._session_key:
             env["KIROCREW_SESSION_KEY"] = self._session_key
         else:
@@ -5715,7 +6062,15 @@ class AcpClient:
         _spawn_label = (
             CLAUDE_ACP_BIN
             if self._is_claude
-            else CODEX_ACP_BIN if self._is_codex else f"{KIRO_CLI_BIN} {KIRO_CLI_SUBCMD}"
+            else (
+                CODEX_ACP_BIN
+                if self._is_codex
+                else (
+                    f"{OPENCODE_BIN} {OPENCODE_ACP_SUBCMD}"
+                    if self._is_opencode
+                    else f"{KIRO_CLI_BIN} {KIRO_CLI_SUBCMD}"
+                )
+            )
         )
         # Everything from here to the end of _spawn runs with a LIVE subprocess
         # that nothing has recorded yet, so every step must be guarded. Without
@@ -5847,7 +6202,11 @@ class AcpClient:
             _bin_label = (
                 "claude-acp"
                 if self._is_claude
-                else CODEX_ACP_BIN if self._is_codex else KIRO_CLI_BIN
+                else (
+                    CODEX_ACP_BIN
+                    if self._is_codex
+                    else OPENCODE_BIN if self._is_opencode else KIRO_CLI_BIN
+                )
             )
             logger.warning("%s stderr: %s", _bin_label, redacted)
         if suppressed:
@@ -6372,10 +6731,8 @@ class AcpClient:
     async def _initialize_session(self) -> None:
         """Handshake: initialize → session/load or session/new → set_mode → set_model."""
         # 1. Initialize
-        protocol_version: int | str = (
-            PROTOCOL_VERSION_CLAUDE
-            if self._is_claude
-            else PROTOCOL_VERSION_CODEX if self._is_codex else PROTOCOL_VERSION
+        protocol_version: int | str = _PROTOCOL_VERSION_BY_BACKEND.get(
+            self.backend, PROTOCOL_VERSION
         )
         init_id = await self._send_request(
             METHOD_INITIALIZE,
@@ -6406,20 +6763,15 @@ class AcpClient:
             # ~38% on turn 1. kiro-cli stores transcripts at ~/.kiro/sessions/
             # cli/<sid>.json; a missing transcript falls back to session/new
             # (a genuinely fresh start).
-            if self._is_claude:
-                # Dormant seam: claude session/load takes no file path, and the
-                # SDK transcript-path resolver lived in the deleted cc cleanup
-                # helper. The internal companion re-adds it; the public core
-                # simply attempts the load.
-                session_file = ""
-                file_ok = True
-            elif self._is_codex:
-                # Same shape as claude, and for the same reason: the adapter keeps
-                # its own session records and resolves them from the sessionId, so
-                # there is no Crew-side file to name. Gating on the kiro transcript
-                # here would make file_ok always False — a codex session could
-                # never resume, it would silently start fresh every time — which is
-                # why the _meta block below gives codex no session_file either.
+            if self.backend in ACP_BACKENDS_HARNESS_OWNED_SESSIONS:
+                # The harness keeps its own session records and resolves them from
+                # the sessionId, so there is no Crew-side file to name. Gating on
+                # the kiro transcript here would make file_ok always False -- such
+                # a session could never resume, it would silently start fresh every
+                # time -- which is why the _meta block below gives it no
+                # session_file either. For claude the SDK transcript-path resolver
+                # is the internal companion's; the public core simply attempts the
+                # load.
                 session_file = ""
                 file_ok = True
             else:
@@ -6445,12 +6797,11 @@ class AcpClient:
                     }
                     if self._is_claude:
                         load_params["_meta"] = {"claudeCode": {"options": {}}}
-                    elif self._is_codex:
-                        # codex-acp carries no Crew-side session file and reads no
-                        # _meta of ours, so it gets neither key rather than the
-                        # kiro session_file it would not know what to do with.
-                        pass
-                    else:
+                    elif self.backend not in ACP_BACKENDS_HARNESS_OWNED_SESSIONS:
+                        # The kiro family reads its transcript path from _meta. A
+                        # harness that owns its sessions reads no _meta of ours,
+                        # so it gets neither key rather than a kiro session_file
+                        # it would not know what to do with.
                         load_params["_meta"] = {"_kiro.dev/session_file": session_file}
                     self._begin_session_report(load_params.get("mcpServers"))
                     # A resumed session re-declares its whole MCP surface, so it can
@@ -6463,7 +6814,14 @@ class AcpClient:
                         method=METHOD_SESSION_LOAD,
                         expected_mcp=load_params.get("mcpServers"),
                     )
-                    if "modes" in load_resp:
+                    # A ``modes`` block is the shape kiro-cli and claude return on a
+                    # successful load, and its absence on THOSE harnesses means the
+                    # load did not really take. A member of
+                    # ACP_BACKENDS_LOAD_WITHOUT_MODES never returns one, so for it a
+                    # response that is not an error IS the successful load -- gating
+                    # it on ``modes`` would fall through to session/new and discard
+                    # the conversation the harness had just restored.
+                    if "modes" in load_resp or self.backend in ACP_BACKENDS_LOAD_WITHOUT_MODES:
                         self._session_id = resume_sid
                         self._resumed = True
                         self._capture_available_models(load_resp)
