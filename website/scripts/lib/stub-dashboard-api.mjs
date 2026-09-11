@@ -122,6 +122,12 @@ export async function stubDashboardApi(page, opts = {}) {
   const {
     folders = [],
     slots = [],
+    // Session tags + board columns. Board view needs BOTH a non-empty
+    // column list from here and `tagColumnsEnabled` in the chat config, so a
+    // harness shooting board view passes these AND that seed via
+    // `localStorageEntries`.
+    tags = [],
+    columns = [],
     theme = 'dark',
     preserveStorage = false,
     // Extra localStorage seeds applied INSIDE this stub's own init script,
@@ -161,6 +167,8 @@ export async function stubDashboardApi(page, opts = {}) {
     }
     if (path === '/api/chat/folders') return json(route, folders)
     if (path === '/api/chat/slots') return json(route, slots)
+    if (path === '/api/chat/tags') return json(route, tags)
+    if (path === '/api/chat/tag-columns') return json(route, columns)
     if (path.startsWith('/api/instances')) return json(route, { instances: [], active: '' })
     if (path === '/api/status') {
       return json(route, { sessions: slots.length, crons: 0, lessons: 0, uptime: 120, version: '0.5.0' })

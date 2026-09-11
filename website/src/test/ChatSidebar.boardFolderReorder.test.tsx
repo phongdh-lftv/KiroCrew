@@ -160,8 +160,15 @@ describe('board view: folder reorder wiring', () => {
     // distance must let plain clicks reach the collapse <button>. Regression
     // guard: a click on the toggle flips this column's collapse state.
     // Board collapse is per-column and client-local, so the flip never
-    // writes the server flag.
-    const { container } = renderSidebar()
+    // writes the server flag. The fixture files a subfolder under Alpha so the
+    // folder is not EMPTY — an empty folder's per-column default is collapsed
+    // (auto-collapse), which would start this case on the opposite state and
+    // stop it saying anything about the click reaching the button.
+    const { container } = renderSidebar([
+      { id: FOLDER_A, name: 'Alpha', order: 0 },
+      { id: 'folder-sub', name: 'Sub', parent_id: FOLDER_A, order: 0 },
+      { id: FOLDER_B, name: 'Bravo', order: 1 },
+    ])
     const header = () => container.querySelector(
       `[data-testid="col-${COL_A}-folder-${FOLDER_A}"] [role="button"][aria-expanded]`,
     ) as HTMLElement

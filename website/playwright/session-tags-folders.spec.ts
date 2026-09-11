@@ -383,7 +383,12 @@ test.describe('Folders inside columns (deep)', () => {
     // sits inside the focus-within-revealed hover group, so an outside-click
     // dismissal left the strip pinned visible with the pointer elsewhere.
     // Pointer dismissals now suppress the focus restore (keyboard Esc keeps it).
+    // The subject folder gets a subfolder so it is not EMPTY: an empty folder's
+    // strip no longer hides at all (it is that row's only visible control), so
+    // an empty subject would measure auto-collapse instead of the focus restore
+    // this case is about.
     const folder = await (await request.post('/api/chat/folders', { data: { name: 'F12-dismiss' } })).json()
+    await request.post('/api/chat/folders', { data: { name: 'F12-child', parent_id: folder.id } })
     await page.goto('/chat')
     const strip = page.locator(`[data-testid="folder-menu-${folder.id}"]`).locator('..')
     await page.locator(`[data-testid="folder-collapse-${folder.id}"]`).hover()

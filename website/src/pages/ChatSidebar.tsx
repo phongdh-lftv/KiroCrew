@@ -4617,19 +4617,87 @@ function ChatSidebar({
   // over the server flag, which stays the default for untouched columns and
   // the sole state for the list view.
   const [boardCollapse, setBoardCollapse] = useState<Map<string, boolean>>(loadBoardFolderCollapse)
-  const boardFolderCollapsed = useCallback((columnId: string, folder: ChatFolder): boolean => {
-    return boardCollapse.get(boardCollapseKey(columnId, folder.id)) ?? !!folder.collapsed
+  // `defaultCollapsed` is what this folder does in a column that has never been
+  // toggled. It is the stored flag ORed with emptiness (see the auto-collapse
+  // note below), passed in by the caller rather than read here, because only the
+  // render site knows whether this column's copy has anything in it.
+  const boardFolderCollapsed = useCallback((columnId: string, folder: ChatFolder, defaultCollapsed = !!folder.collapsed): boolean => {
+    return boardCollapse.get(boardCollapseKey(columnId, folder.id)) ?? defaultCollapsed
   }, [boardCollapse])
-  const toggleColumnCollapse = useCallback((columnId: string, folder: ChatFolder) => {
+  const toggleColumnCollapse = useCallback((columnId: string, folder: ChatFolder, defaultCollapsed = !!folder.collapsed, ephemeral = false) => {
     setBoardCollapse(prev => {
       const next = new Map(prev)
-      const value = !(prev.get(boardCollapseKey(columnId, folder.id)) ?? !!folder.collapsed)
+      const value = !(prev.get(boardCollapseKey(columnId, folder.id)) ?? defaultCollapsed)
       next.set(boardCollapseKey(columnId, folder.id), value)
       // Delta write: another tab's overrides must survive this tab's toggle.
-      persistBoardOverride(columnId, folder.id, value)
+      // Skipped when the flip is only against an emptiness default (`ephemeral`):
+      // the tree forgets an empty folder you opened by hand, on purpose, and a
+      // durable override here would instead reopen it on every future reload.
+      // The in-memory entry still stands, so the column stays open this session.
+      if (!ephemeral) persistBoardOverride(columnId, folder.id, value)
       return next
     })
   }, [])
+
+  // ── Auto-collapse empty folders ──
+  // An empty folder has nothing to show but its own "New chat in <name>" row,
+  // so an expanded one spends a full row on holding no session. A tree with
+  // twenty area folders spends most of the sidebar's height that way, pushing
+  // real sessions below the fold. Empty folders therefore render collapsed
+  // whatever the stored flag says, and nothing is lost: the header still reads
+  // its 0 count, its hover ⊕ and ⋯ menu still create in it, and one click on
+  // the row opens it.
+  //
+  // Emptiness enters each view through that view's OWN collapse state. Board
+  // columns already layer a per-column override over a default, so there it is
+  // just a second term in the default (`defaultCollapsed` above) and per-column
+  // independence is untouched. The tree has no such layer, so it gets this set.
+  //
+  // While a folder is empty this Set is the ONLY thing that decides, in both
+  // views: the stored `collapsed` flag is neither read nor written there. That
+  // is not a shortcut, it is the point. The flag is the user's preference for
+  // the folder when it HAS content, so an empty folder must not spend it -
+  // writing `collapsed: false` to open an empty folder threw away a `true` the
+  // user had set, and the folder then came back expanded once it was populated
+  // again. Leaving the flag alone means the preference survives being emptied.
+  // The Set is ephemeral on purpose too: a folder still empty next session is
+  // still noise, so a reload starts it collapsed again.
+  const [emptyExpanded, setEmptyExpanded] = useState<Set<string>>(() => new Set())
+  const toggleEmptyExpanded = useCallback((folderId: string) => {
+    setEmptyExpanded(prev => {
+      const next = new Set(prev)
+      if (next.has(folderId)) next.delete(folderId)
+      else next.add(folderId)
+      return next
+    })
+  }, [])
+  // A folder id that appears AFTER the first load is one somebody just made —
+  // this tab's modal, an agent's folder tool, another tab. Exempt it: an
+  // immediately collapsed new folder reads as the create having failed, and
+  // creation is the one moment the empty-folder affordance is what the user
+  // wants to see. Folders present on the first load get no exemption.
+  //
+  // Gated on `foldersLoaded`, and that gate is the whole correctness of this
+  // effect: `folders` is [] while the query is in flight, so an ungated first
+  // pass would record an EMPTY baseline and then read the entire tree as
+  // freshly created, exempting every folder in it. That is invisible to a test
+  // that seeds the cache before mounting (the tree is already there on the
+  // first render) and shows up only against the real app.
+  const knownFolderIdsRef = useRef<Set<string> | null>(null)
+  useEffect(() => {
+    if (!foldersLoaded) return
+    const ids = new Set(folders.map(f => f.id))
+    const previous = knownFolderIdsRef.current
+    knownFolderIdsRef.current = ids
+    if (!previous) return
+    const fresh = [...ids].filter(id => !previous.has(id))
+    if (fresh.length === 0) return
+    setEmptyExpanded(prev => {
+      const next = new Set(prev)
+      for (const id of fresh) next.add(id)
+      return next
+    })
+  }, [folders, foldersLoaded])
 
   // ── Folder drag-to-reorder ──
   // Mouse and touch are split on purpose; the split and its WebKit reasoning
@@ -5304,6 +5372,16 @@ function ChatSidebar({
     const childFolders = folders.filter(f => f.parent_id === folder.id)
     const { rows: childSlots, navScope: folderLaneScope, container: folderHoldContainer } = heldLane(filteredSlots.filter(s => colSlotKeys.has(s.key) && slotFolders[s.key] === folder.id), columnId, `board:${columnId}:folder:${folder.id}`)
     const deepChildren = childFolders
+    // List-view parity: a column copy holding nothing collapses on its own (see
+    // the auto-collapse note beside `emptyExpanded`). It enters as the column's
+    // DEFAULT, so this column's own override still wins and collapsing here
+    // still leaves the other columns alone. `emptyExpanded` joins the default
+    // rather than overriding it, which is what carries the just-created
+    // exemption into board view: a folder somebody just made must not read as a
+    // failed create in either view.
+    const emptyBody = deepChildren.length === 0 && childSlots.length === 0
+    const defaultCollapsed = emptyBody ? !emptyExpanded.has(folder.id) : !!folder.collapsed
+    const collapsed = boardFolderCollapsed(columnId, folder, defaultCollapsed)
     // Valid "Move folder to" destinations: everything outside this folder's
     // own subtree (cycle guard). One O(1) lookup, computed once per row.
     const subtreeIds = folderSubtrees.get(folder.id) ?? collectFolderSubtreeIds(folders, folder.id)
@@ -5354,13 +5432,13 @@ function ChatSidebar({
           style={{ paddingLeft: '6px' }}
           role="button"
           tabIndex={0}
-          aria-expanded={!boardFolderCollapsed(columnId, folder)}
-          aria-label={boardFolderCollapsed(columnId, folder) ? i18nT('pages.chatSidebar.expand_folder_name', { name: folder.name }) : i18nT('pages.chatSidebar.collapse_folder_name', { name: folder.name })}
+          aria-expanded={!collapsed}
+          aria-label={collapsed ? i18nT('pages.chatSidebar.expand_folder_name', { name: folder.name }) : i18nT('pages.chatSidebar.collapse_folder_name', { name: folder.name })}
           {...(draggable ? dragHandleProps : {})}
-          onClick={() => toggleColumnCollapse(columnId, folder)}
-          onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleColumnCollapse(columnId, folder) } }}
+          onClick={() => toggleColumnCollapse(columnId, folder, defaultCollapsed, emptyBody)}
+          onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleColumnCollapse(columnId, folder, defaultCollapsed, emptyBody) } }}
         >
-          <FolderGlyph color={folder.color} size={11} open={!boardFolderCollapsed(columnId, folder)} />
+          <FolderGlyph color={folder.color} size={11} open={!collapsed} />
           {editingId === folder.id && editScope === columnId ? (
             /* Inline rename input — board-view parity with renderFolderHeader.
              *  Without this branch the ⋯-menu "Rename" set editingId but no
@@ -5375,9 +5453,11 @@ function ChatSidebar({
             // eslint-disable-next-line jsx-a11y/no-static-element-interactions
             <span className="flex-1 truncate" title={i18nT('pages.chatSidebar.double_click_to_rename')} onDoubleClick={e => { e.stopPropagation(); setEditingId(folder.id); setEditScope(columnId); setEditName(folder.name) }}>{folder.name}</span>
           )}
-          <span className="text-[10px] text-muted shrink-0">{count}</span>
+          {!emptyBody && <span className="text-[10px] text-muted shrink-0">{count}</span>}
+          {/* List-view parity: an empty folder's row keeps its action cluster
+            *  visible (see the note in renderFolderHeader). */}
           {!(editingId === folder.id && editScope === columnId) && (
-          <span className="opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 focus-within:opacity-100 has-[[data-state=open]]:opacity-100 transition-opacity flex items-center gap-0.5">
+          <span className={`${emptyBody ? '' : 'opacity-0 '}group-hover:opacity-100 group-focus-within:opacity-100 focus-within:opacity-100 has-[[data-state=open]]:opacity-100 transition-opacity flex items-center gap-0.5`}>
             {/* ⋯ menu + a primary "new chat in folder" action, mirroring the
              *  list-view folder header (renderFolderHeader) so board view has
              *  the same one-click way to start a session inside a folder. */}
@@ -5434,7 +5514,7 @@ function ChatSidebar({
           )}
         </div>
         {renderFolderCreateError(folder.id, columnId)}
-        <FolderBody padding={FOLDER_BODY_OPEN_PADDING} open={!boardFolderCollapsed(columnId, folder) && !forceCollapsed}>
+        <FolderBody padding={FOLDER_BODY_OPEN_PADDING} open={!collapsed && !forceCollapsed}>
           {/* ml-4 + no pl: flush-connector treatment matching the list-view
            *  folder body (renderFolderBlock) so nested rows sit identically
            *  against the connector line in both views. */}
@@ -5632,10 +5712,13 @@ function ChatSidebar({
     )
   }
 
-  const renderFolderHeader = (folder: ChatFolder, dragHandleProps?: React.HTMLAttributes<HTMLElement>) => {
+  const renderFolderHeader = (folder: ChatFolder, dragHandleProps?: React.HTMLAttributes<HTMLElement>, emptyBody = false) => {
     const childFolders = folders.filter(f => f.parent_id === folder.id)
     const childSlots = filteredSlots.filter(s => slotFolders[s.key] === folder.id)
     const count = childSlots.length + childFolders.length
+    // What the row DISPLAYS, which for an empty folder is not the stored flag:
+    // emptiness collapses it on its own until the user clicks it open.
+    const collapsed = emptyBody ? !emptyExpanded.has(folder.id) : !!folder.collapsed
     const hasUnread = folderTreeHasUnread(folder.id)
     const draggable = !!dragHandleProps && editingId !== folder.id
     // Valid "Move folder to" destinations: everything outside this folder's
@@ -5699,7 +5782,7 @@ function ChatSidebar({
         className={`group relative flex items-center gap-2 px-3.5 py-1.5 rounded-md text-sm text-muted hover:text-text hover:bg-bg-hover transition-all ${draggable ? 'cursor-grab active:cursor-grabbing' : ''}`}>
         {editingId === folder.id && editScope === 'list' ? (
           <>
-            <FolderGlyph color={folder.color} size={14} open={!folder.collapsed} />
+            <FolderGlyph color={folder.color} size={14} open={!collapsed} />
             <Input ref={folderEditInputRef} className="flex-1 py-0.5 text-[13px] min-w-0" value={editName} onChange={e => setEditName(e.target.value)} onClick={e => e.stopPropagation()} onMouseDown={e => e.stopPropagation()} {...ime.bindEnter<HTMLInputElement>({ onEnter: () => renameCommit(folder.id, editName), onEscape: () => setEditingId(null), onBlur: () => renameCommit(folder.id, editName) })} />
             <span className="text-[11px] text-muted tabular-nums shrink-0">{count}</span>
           </>
@@ -5710,10 +5793,10 @@ function ChatSidebar({
              *  the folder glyph/name still toggles.  Double-click the name renames. */}
             <button type="button"
               className="flex items-center gap-[5px] flex-1 min-w-0 bg-transparent border-none cursor-pointer text-left text-inherit p-0"
-              aria-expanded={!folder.collapsed}
-              aria-label={folder.collapsed ? i18nT('pages.chatSidebar.expand_folder_name', { name: folder.name }) : i18nT('pages.chatSidebar.collapse_folder_name', { name: folder.name })}
-              onClick={() => toggleCollapse(folder.id)}>
-              <FolderGlyph color={folder.color} size={14} open={!folder.collapsed} testId={`folder-collapse-${folder.id}`} />
+              aria-expanded={!collapsed}
+              aria-label={collapsed ? i18nT('pages.chatSidebar.expand_folder_name', { name: folder.name }) : i18nT('pages.chatSidebar.collapse_folder_name', { name: folder.name })}
+              onClick={() => { if (emptyBody) toggleEmptyExpanded(folder.id); else toggleCollapse(folder.id) }}>
+              <FolderGlyph color={folder.color} size={14} open={!collapsed} testId={`folder-collapse-${folder.id}`} />
               {/* Double-click rename is a mouse-only power shortcut; the accessible
                *  path is the ⋯-menu Rename item, so scope-disable the interaction rule. */}
               {/* eslint-disable-next-line jsx-a11y/no-static-element-interactions */}
@@ -5735,7 +5818,7 @@ function ChatSidebar({
                *  session row's), so the dot goes back where it does not compete with
                *  it. Only when collapsed: an expanded folder's child rows carry
                *  their own markers. */}
-              {hasUnread && folder.collapsed && (
+              {hasUnread && collapsed && (
                 // Carries the same accessible name as a session row's unread
                 // marker, and the SAME i18n key: a colour-only dot is invisible to
                 // a screen reader and indistinguishable from decoration, and this
@@ -5747,13 +5830,20 @@ function ChatSidebar({
                   aria-label={i18nT('pages.chatSidebar.agent_finished_your_turn')}
                   title={i18nT('pages.chatSidebar.agent_finished_your_turn')} />
               )}
-              <span className="text-[11px] text-muted tabular-nums shrink-0">{count}</span>
+              {!emptyBody && <span className="text-[11px] text-muted tabular-nums shrink-0">{count}</span>}
             </button>
             {folder.default_agent && <span className="text-[10px] text-accent bg-accent/10 px-1.5 py-0.5 rounded-full shrink-0 truncate max-w-[60px]" title={i18nT('pages.chatSidebar.default_agent', { name: folder.default_agent })}>{folder.default_agent}</span>}
           </>
         )}
+        {/* An empty folder's row is otherwise a dead end: hiding the body took
+          *  away the only control it had, and the closed glyph alone does not say
+          *  the row can be opened or created in. So the row's own action cluster
+          *  stops hiding on an empty folder — it already holds exactly the two
+          *  controls that row needs (create, and the ⋯ menu whose rename/delete
+          *  is what an empty folder usually wants), so nothing is ADDED to the
+          *  row and the two-buttons-per-row cap is untouched. */}
         {!(editingId === folder.id && editScope === 'list') && (
-        <div className="absolute top-1/2 -translate-y-1/2 right-1.5 transition-all flex items-center gap-0.5 rounded-md p-1 bg-card border border-border shadow-sm opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 focus-within:opacity-100 has-[[data-state=open]]:opacity-100">
+        <div className={`absolute top-1/2 -translate-y-1/2 right-1.5 transition-all flex items-center gap-0.5 rounded-md p-1${emptyBody ? '' : ' bg-card border border-border shadow-sm opacity-0'} group-hover:bg-card group-hover:border group-hover:border-border group-hover:shadow-sm group-hover:opacity-100 group-focus-within:opacity-100 focus-within:opacity-100 has-[[data-state=open]]:opacity-100`}>
           {/* ⋯ menu first, then the primary "new chat" action.  Sibling
            *  <button>s of the collapse toggle (valid ARIA — no nesting). */}
           <DropdownMenu>
@@ -5814,7 +5904,7 @@ function ChatSidebar({
               <DropdownMenuItem className="text-danger focus:text-danger" data-testid={`folder-delete-${folder.id}`} onClick={() => { if (confirm(i18nT('pages.chatSidebar.delete_folder_confirm', { name: folder.name }))) deleteFolderMutation.mutate(folder.id) }}><X size={13} /> {i18nT('pages.chatSidebar.delete_folder')}</DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
-          <button type="button" className="cursor-pointer p-[4px] rounded text-muted hover:text-accent hover:bg-bg-hover transition-all bg-transparent border-none" title={i18nT('pages.chatSidebar.new_chat_in_name', { name: folder.name })} aria-label={i18nT('pages.chatSidebar.new_chat_in_name', { name: folder.name })} onClick={e => { e.stopPropagation(); createChatInFolder(folder.id) }}><MessageSquarePlus size={12} /></button>
+          <button type="button" data-testid={`folder-new-chat-${folder.id}`} className="cursor-pointer p-[4px] rounded text-muted hover:text-accent hover:bg-bg-hover transition-all bg-transparent border-none" title={i18nT('pages.chatSidebar.new_chat_in_name', { name: folder.name })} aria-label={i18nT('pages.chatSidebar.new_chat_in_name', { name: folder.name })} onClick={e => { e.stopPropagation(); createChatInFolder(folder.id) }}><MessageSquarePlus size={12} /></button>
         </div>
         )}
       </div>
@@ -5936,6 +6026,11 @@ function ChatSidebar({
         </button>
       </div>
     ) : null
+    // `childNodes` is empty exactly when this folder holds no session, no
+    // visible subfolder and no filter-reveal row — the case where the body is
+    // nothing but the affordance above, and the case auto-collapse is for.
+    const emptyBody = childNodes.length === 0
+    const autoCollapsed = emptyBody && !emptyExpanded.has(folder.id)
     // Outer container wraps header + body so the entire folder block is a
     // single drag-drop target. Dropping anywhere inside (header, children,
     // empty space) assigns the dragged session to this folder.
@@ -5946,9 +6041,9 @@ function ChatSidebar({
       <DndDroppable key={`folder-drop-${folder.id}`} id={`folder-drop:${folder.id}`} data={{ type: 'folder-drop', folderId: folder.id }}>
         {({ setNodeRef, isOver }) => (
           <div ref={setNodeRef} data-folder-drop={folder.id} className={`rounded-md transition-all mb-0.5${isOver ? ' ring-1 ring-accent' : ''}`}>
-            {renderFolderHeader(folder, dragHandleProps)}
+            {renderFolderHeader(folder, dragHandleProps, emptyBody)}
             {renderFolderCreateError(folder.id)}
-            <FolderBody key={`folder-body-${folder.id}`} padding={FOLDER_BODY_OPEN_PADDING} open={!folder.collapsed && !forceCollapsed}>{wrapped}</FolderBody>
+            <FolderBody key={`folder-body-${folder.id}`} padding={FOLDER_BODY_OPEN_PADDING} open={!folder.collapsed && !forceCollapsed && !autoCollapsed}>{wrapped}</FolderBody>
           </div>
         )}
       </DndDroppable>,
